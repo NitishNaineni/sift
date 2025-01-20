@@ -3,21 +3,19 @@ struct VSOutput {
     @location(0) texcoord: vec2f,
 };
 
+var<private> POSITIONS: array<vec2f, 4> = array<vec2f, 4>(
+    vec2f(0.0, 0.0),
+    vec2f(1.0, 0.0),
+    vec2f(0.0, 1.0),
+    vec2f(1.0, 1.0),
+);
+
 @vertex
 fn vs(@builtin(vertex_index) vertexIndex: u32) -> VSOutput {
-    var pos: vec2f;
-    switch (vertexIndex) {
-        case 0u: { pos = vec2f(0.0, 0.0); }
-        case 1u: { pos = vec2f(1.0, 0.0); }
-        case 2u: { pos = vec2f(0.0, 1.0); }
-        case 3u: { pos = vec2f(0.0, 1.0); }
-        case 4u: { pos = vec2f(1.0, 0.0); }
-        case 5u: { pos = vec2f(1.0, 1.0); }
-        default: { pos = vec2f(0.0, 0.0); }
-    }
-
+    let pos = POSITIONS[vertexIndex];
     var vsOutput: VSOutput;
-    vsOutput.position = vec4f(pos * 2.0 - 1.0, 0.0, 1.0);
+    let transformedPos = pos * 2.0 - 1.0;
+    vsOutput.position = vec4f(transformedPos, 0.0, 1.0);
     vsOutput.texcoord = vec2f(pos.x, 1.0 - pos.y);
     return vsOutput;
 }
