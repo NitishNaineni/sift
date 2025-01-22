@@ -1,248 +1,157 @@
-import argparse
-import asyncio
-import logging
 import os
-import time
-from contextlib import contextmanager
+import struct
 
 import numpy as np
 import wgpu
-from colorama import Fore, Style, init
 from PIL import Image
-from wgpu import GPUDevice, GPUTexture
+
+OCTAVES = 4
+
+gpu = wgpu.GPU()
+adapter = gpu.request_adapter_sync(
+    power_preference="high-performance", force_fallback_adapter=False
+)
+device = adapter.request_device_sync()
 
 
-@contextmanager
-def timer(name: str):
-    start = time.perf_counter()
-    yield
-    end = time.perf_counter()
-    print(f"{name}: {(end - start) * 1000:.2f}ms")
+image = Image.open("data/0.jpg").convert("L")
+width, height = image.size
 
 
-init()
+image_pyramid = []
+for level in range(OCTAVES):
+    buffer_size = max(1, width >> level) * max(1, height >> level) * 4
+    usage = (
+        wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST | wgpu.BufferUsage.COPY_SRC
+        if level == 0
+        else wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC
+    )
+    buffer = device.create_buffer(size=buffer_size, usage=usage)
+    image_pyramid.append(buffer)
 
+image_pyramid_read = []
+for level in range(OCTAVES):
+    buffer_size = max(1, width >> level) * max(1, height >> level) * 4
+    usage = wgpu.BufferUsage.COPY_DST | wgpu.BufferUsage.MAP_READ
+    buffer = device.create_buffer(size=buffer_size, usage=usage)
+    image_pyramid_read.append(buffer)
 
-class ColoredFormatter(logging.Formatter):
-    COLORS = {
-        "DEBUG": Fore.CYAN,
-        "INFO": Fore.GREEN,
-        "WARNING": Fore.YELLOW,
-        "ERROR": Fore.RED,
-        "CRITICAL": Fore.RED + Style.BRIGHT,
-    }
+upload_buffer = device.create_buffer(size=width * height * 4, usage="MAP_WRITE | COPY_SRC")
+upload_buffer.map_sync(mode="WRITE", offset=0, size=upload_buffer.size)
+upload_buffer.write_mapped(np.asarray(image).astype(np.float32))
+upload_buffer.unmap()
 
-    def format(self, record):
-        color = self.COLORS.get(record.levelname, "")
-        record.levelname = f"{color}{record.levelname}{Style.RESET_ALL}"
-        return f"{record.levelname}: {record.getMessage()}"
+param_buffers = {}
+for level in range(1, OCTAVES):
+    src_width = max(1, width >> (level - 1))
+    src_height = max(1, height >> (level - 1))
+    dst_width = max(1, width >> level)
+    dst_height = max(1, height >> level)
 
+    param_buffer = device.create_buffer_with_data(
+        label=f"param_buffer_{level}",
+        data=struct.pack("4I", src_width, src_height, dst_width, dst_height),
+        usage="UNIFORM",
+    )
+    param_buffers[level] = param_buffer
 
-logger = logging.getLogger("sift")
+with open("shaders/box.wgsl", "r") as f:
+    box_code = f.read()
+box_module = device.create_shader_module(code=box_code)
 
-
-def setup_logger(debug: bool = False):
-    if debug:
-        logger.setLevel(logging.DEBUG)
-        if not logger.handlers:
-            handler = logging.StreamHandler()
-            handler.setFormatter(ColoredFormatter())
-            logger.addHandler(handler)
-        logger.debug("Debug logging enabled")
-
-
-def save_mipmaps(
-    device: GPUDevice,
-    texture: GPUTexture,
-    width: int,
-    height: int,
-    mip_level_count: int,
-    image_index: int,
-    output_dir: str,
-) -> None:
-    logger.debug(f"Saving mipmaps for image {image_index} with {mip_level_count} levels")
-    base_dir = os.path.join(output_dir, f"image_{image_index}")
-    os.makedirs(base_dir, exist_ok=True)
-
-    current_width, current_height = width, height
-
-    for mip_level in range(mip_level_count):
-        try:
-            data = device.queue.read_texture(
-                {
-                    "texture": texture,
-                    "mip_level": mip_level,
-                    "origin": (0, 0, 0),
-                },
-                {
-                    "bytes_per_row": current_width,
-                    "rows_per_image": current_height,
-                },
-                (current_width, current_height, 1),
-            )
-
-            data_array = np.frombuffer(data, dtype=np.uint8).reshape(current_height, current_width)
-
-            output_path = os.path.join(base_dir, f"mip_{mip_level}.png")
-            Image.fromarray(data_array).save(output_path)
-        except Exception as e:
-            logger.error(f"Failed to save mip level {mip_level}: {e}")
-            continue
-
-        current_width = max(1, current_width // 2)
-        current_height = max(1, current_height // 2)
-
-
-async def process_batch(
-    device: GPUDevice,
-    images: list[Image.Image],
-    batch_size: int = 10,
-    mip_levels: int = 4,
-    save_dir: str | None = None,
-) -> None:
-    assert all(image.size == images[0].size for image in images), "All images must be the same size"
-    width, height = images[0].size
-    aligned_width = (width + 255) & ~255
-
-    try:
-        shader_code = open("mips.wgsl").read()
-    except IOError as e:
-        raise RuntimeError(f"Failed to load mipmap shader: {e}")
-
-    shader_module = device.create_shader_module(code=shader_code)
-    pipeline = device.create_render_pipeline(
-        layout="auto",
-        vertex={"module": shader_module, "entry_point": "vs"},
-        fragment={
-            "module": shader_module,
-            "entry_point": "fs",
-            "targets": [{"format": "r8unorm"}],
+bind_group_layout = device.create_bind_group_layout(
+    entries=[
+        {
+            "binding": 0,
+            "visibility": wgpu.ShaderStage.COMPUTE,
+            "buffer": {
+                "type": wgpu.BufferBindingType.uniform,
+            },
         },
-        primitive={"topology": wgpu.PrimitiveTopology.triangle_strip},
-    )
-    sampler = device.create_sampler(
-        min_filter="linear",
-        mag_filter="linear",
-        mipmap_filter="linear",
-    )
+        {
+            "binding": 1,
+            "visibility": wgpu.ShaderStage.COMPUTE,
+            "buffer": {
+                "type": wgpu.BufferBindingType.read_only_storage,
+            },
+        },
+        {
+            "binding": 2,
+            "visibility": wgpu.ShaderStage.COMPUTE,
+            "buffer": {
+                "type": wgpu.BufferBindingType.storage,
+            },
+        },
+    ]
+)
 
-    textures = []
-    for idx in range(batch_size):
-        texture = device.create_texture(
-            size=(width, height, 1),
-            format="r8unorm",
-            usage=wgpu.TextureUsage.TEXTURE_BINDING
-            | wgpu.TextureUsage.COPY_DST
-            | wgpu.TextureUsage.RENDER_ATTACHMENT
-            | wgpu.TextureUsage.COPY_SRC,
-            mip_level_count=mip_levels,
-        )
-        views = []
-        for level in range(mip_levels):
-            views.append(
-                texture.create_view(base_mip_level=level, mip_level_count=1, dimension="2d")
-            )
-        textures.append({"texture": texture, "views": views})
+pipeline_layout = device.create_pipeline_layout(bind_group_layouts=[bind_group_layout])
 
-    for batch_start in range(0, len(images), batch_size):
-        batch_end = min(batch_start + batch_size, len(images))
-        batch = images[batch_start:batch_end]
-        logger.debug(f"Processing batch {batch_start // batch_size + 1} with {len(batch)} images")
+compute_pipeline = device.create_compute_pipeline(
+    layout=pipeline_layout,
+    compute={
+        "module": box_module,
+        "entry_point": "main",
+    },
+)
 
-        encoder = device.create_command_encoder(label="Batch Mipmap Generation")
+command_encoder = device.create_command_encoder()
 
-        for idx, image in enumerate(batch):
-            padded_image = np.pad(image, ((0, 0), (0, aligned_width - width)), mode="constant")
-
-            device.queue.write_texture(
-                {"texture": textures[idx]["texture"], "mip_level": 0, "origin": (0, 0, 0)},
-                padded_image,
-                {"bytes_per_row": aligned_width, "rows_per_image": height},
-                (width, height, 1),
-            )
-
-            for level in range(mip_levels - 1):
-                src_view = textures[idx]["views"][level]
-                dst_view = textures[idx]["views"][level + 1]
-
-                bind_group = device.create_bind_group(
-                    layout=pipeline.get_bind_group_layout(0),
-                    entries=[
-                        {"binding": 0, "resource": sampler},
-                        {"binding": 1, "resource": src_view},
-                    ],
-                )
-
-                render_pass_encoder = encoder.begin_render_pass(
-                    color_attachments=[
-                        {
-                            "view": dst_view,
-                            "clear_value": (0.0, 0.0, 0.0, 1.0),
-                            "load_op": "load",
-                            "store_op": "store",
-                        }
-                    ],
-                )
-                render_pass_encoder.set_pipeline(pipeline)
-                render_pass_encoder.set_bind_group(0, bind_group)
-                render_pass_encoder.draw(4, 1, 0, 0)
-                render_pass_encoder.end()
-
-        device.queue.submit([encoder.finish()])
-
-        if save_dir is not None:
-            mipmap_save_dir = os.path.join(save_dir, "mipmaps")
-            os.makedirs(mipmap_save_dir, exist_ok=True)
-            for idx in range(len(batch)):
-                save_mipmaps(
-                    device,
-                    textures[idx]["texture"],
-                    width,
-                    height,
-                    mip_levels,
-                    batch_start + idx,
-                    mipmap_save_dir,
-                )
-
-
-async def main():
-    parser = argparse.ArgumentParser(description="Mipmap Generator")
-    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
-    parser.add_argument("--save", type=str, help="Dir to save the whole pipeline")
-
-    args = parser.parse_args()
-
-    setup_logger(args.debug)
-
-    gpu = wgpu.GPU()
-    adapter = await gpu.request_adapter_async(
-        power_preference="high-performance",
-        force_fallback_adapter=False,
+command_encoder.copy_buffer_to_buffer(
+    source=upload_buffer,
+    source_offset=0,
+    destination=image_pyramid[0],
+    destination_offset=0,
+    size=image_pyramid[0].size,
+)
+for level in range(1, OCTAVES):
+    bind_group = device.create_bind_group(
+        layout=bind_group_layout,
+        entries=[
+            {"binding": 0, "resource": {"buffer": param_buffers[level]}},
+            {"binding": 1, "resource": {"buffer": image_pyramid[level - 1]}},
+            {"binding": 2, "resource": {"buffer": image_pyramid[level]}},
+        ],
     )
 
-    if adapter is None:
-        logger.error("No suitable GPU adapter found!")
-        return
+    compute_pass = command_encoder.begin_compute_pass()
+    compute_pass.set_pipeline(compute_pipeline)
+    compute_pass.set_bind_group(index=0, bind_group=bind_group)
 
-    logger.debug(f"Using adapter: {adapter.info}")
-    device = await adapter.request_device_async()
-    logger.debug("Device created successfully")
+    level_width = max(1, width >> level)
+    level_height = max(1, height >> level)
+    workgroup_size = (8, 8, 1)
+    workgroup_count_x = (level_width + workgroup_size[0] - 1) // workgroup_size[0]
+    workgroup_count_y = (level_height + workgroup_size[1] - 1) // workgroup_size[1]
+    compute_pass.dispatch_workgroups(
+        workgroup_count_x=workgroup_count_x, workgroup_count_y=workgroup_count_y
+    )
 
-    images = []
-    for i in range(82):
-        try:
-            img = Image.open(f"data/{i}.jpg").convert("L")
-            images.append(img)
-        except IOError as e:
-            print(f"Failed to load image {i}: {e}")
-            continue
-    with timer("Processing batch"):
-        await process_batch(
-            device,
-            images,
-            save_dir=args.save,
-        )
+    compute_pass.end()
 
+command_buffer = command_encoder.finish()
+device.queue.submit([command_buffer])
 
-if __name__ == "__main__":
-    asyncio.run(main())
+command_encoder = device.create_command_encoder()
+for level in range(OCTAVES):
+    command_encoder.copy_buffer_to_buffer(
+        source=image_pyramid[level],
+        source_offset=0,
+        destination=image_pyramid_read[level],
+        destination_offset=0,
+        size=image_pyramid[level].size,
+    )
+command_buffer = command_encoder.finish()
+device.queue.submit([command_buffer])
+
+os.makedirs("results", exist_ok=True)
+results = []
+for level in range(OCTAVES):
+    image_pyramid_read[level].map_sync(mode="READ", offset=0, size=image_pyramid_read[level].size)
+    image_data = image_pyramid_read[level].read_mapped()
+    image_pyramid_read[level].unmap()
+    level_width = max(1, width >> level)
+    level_height = max(1, height >> level)
+    image_array = np.frombuffer(image_data, dtype=np.float32).reshape(level_height, level_width)
+    image = Image.fromarray(image_array.astype(np.uint8))
+    image.save(f"results/level_{level}.png")
