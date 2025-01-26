@@ -48,6 +48,29 @@ def create_gaussian_pyramid_buffers(
     return pyramid, pyramid_read
 
 
+def create_dog_buffers(
+    device: wgpu.GPUDevice, width: int, height: int
+) -> tuple[list[list[wgpu.GPUBuffer]], list[list[wgpu.GPUBuffer]]]:
+    pyramid, pyramid_read = [], []
+    for octave in range(OCTAVES):
+        octave_width = max(1, width >> octave)
+        octave_height = max(1, height >> octave)
+        buffer_size = octave_width * octave_height * 4
+        buffers, buffers_read = [], []
+        for _ in range(SCALES + 2):
+            buf = device.create_buffer(
+                size=buffer_size, usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC
+            )
+            buffers.append(buf)
+            buf_read = device.create_buffer(
+                size=buffer_size, usage=wgpu.BufferUsage.COPY_DST | wgpu.BufferUsage.MAP_READ
+            )
+            buffers_read.append(buf_read)
+        pyramid.append(buffers)
+        pyramid_read.append(buffers_read)
+    return pyramid, pyramid_read
+
+
 def create_param_buffers(
     device: wgpu.GPUDevice, width: int, height: int
 ) -> tuple[dict[int, wgpu.GPUBuffer], dict[int, wgpu.GPUBuffer], dict[int, wgpu.GPUBuffer]]:
@@ -99,7 +122,7 @@ def create_compute_pipeline(
     return pipeline
 
 
-def dispatch_blur(
+def dispatch(
     command_encoder: wgpu.GPUCommandEncoder,
     pipeline: wgpu.GPUComputePipeline,
     bind_group: wgpu.GPUBindGroup,
@@ -108,22 +131,6 @@ def dispatch_blur(
 ) -> None:
     workgroup_count_x = (width + WORKGROUP_SIZE[0] - 1) // WORKGROUP_SIZE[0]
     workgroup_count_y = (height + WORKGROUP_SIZE[1] - 1) // WORKGROUP_SIZE[1]
-    pass_enc = command_encoder.begin_compute_pass()
-    pass_enc.set_pipeline(pipeline)
-    pass_enc.set_bind_group(0, bind_group)
-    pass_enc.dispatch_workgroups(workgroup_count_x, workgroup_count_y)
-    pass_enc.end()
-
-
-def dispatch_box(
-    command_encoder: wgpu.GPUCommandEncoder,
-    pipeline: wgpu.GPUComputePipeline,
-    bind_group: wgpu.GPUBindGroup,
-    dst_width: int,
-    dst_height: int,
-) -> None:
-    workgroup_count_x = (dst_width + WORKGROUP_SIZE[0] - 1) // WORKGROUP_SIZE[0]
-    workgroup_count_y = (dst_height + WORKGROUP_SIZE[1] - 1) // WORKGROUP_SIZE[1]
     pass_enc = command_encoder.begin_compute_pass()
     pass_enc.set_pipeline(pipeline)
     pass_enc.set_bind_group(0, bind_group)
@@ -152,7 +159,7 @@ def save_gaussian_pyramid(
                 size=size_bytes,
             )
     device.queue.submit([command_encoder.finish()])
-    os.makedirs("output", exist_ok=True)
+    os.makedirs("output/scale_space", exist_ok=True)
     for octave in range(OCTAVES):
         octave_width = max(1, width >> octave)
         octave_height = max(1, height >> octave)
@@ -162,7 +169,43 @@ def save_gaussian_pyramid(
             data = buf.read_mapped()
             img_data = np.frombuffer(data, dtype=np.float32).reshape((octave_height, octave_width))
             img_data = (img_data * 255).clip(0, 255).astype(np.uint8)
-            Image.fromarray(img_data).save(f"output/octave_{octave}_scale_{scale}.png")
+            Image.fromarray(img_data).save(f"output/scale_space/octave_{octave}_scale_{scale}.png")
+            buf.unmap()
+
+
+def save_dog_pyramid(
+    device: wgpu.GPUDevice,
+    pyramid: list[list[wgpu.GPUBuffer]],
+    pyramid_read: list[list[wgpu.GPUBuffer]],
+    width: int,
+    height: int,
+) -> None:
+    command_encoder = device.create_command_encoder()
+    for octave in range(OCTAVES):
+        octave_width = max(1, width >> octave)
+        octave_height = max(1, height >> octave)
+        for scale in range(SCALES + 2):
+            size_bytes = octave_width * octave_height * 4
+            command_encoder.copy_buffer_to_buffer(
+                source=pyramid[octave][scale],
+                source_offset=0,
+                destination=pyramid_read[octave][scale],
+                destination_offset=0,
+                size=size_bytes,
+            )
+    device.queue.submit([command_encoder.finish()])
+    os.makedirs("output/dog", exist_ok=True)
+    for octave in range(OCTAVES):
+        octave_width = max(1, width >> octave)
+        octave_height = max(1, height >> octave)
+        for scale in range(SCALES + 2):
+            buf = pyramid_read[octave][scale]
+            buf.map_sync(mode=wgpu.MapMode.READ)
+            data = buf.read_mapped()
+            img_data = np.frombuffer(data, dtype=np.float32).reshape((octave_height, octave_width))
+            img_data = (img_data + 1) / 2
+            img_data = (img_data * 255).clip(0, 255).astype(np.uint8)
+            Image.fromarray(img_data).save(f"output/dog/octave_{octave}_scale_{scale}.png")
             buf.unmap()
 
 
@@ -179,6 +222,7 @@ def main() -> None:
         data=base_image_np, usage="STORAGE", label="base_image_buffer"
     )
     gaussian_pyramid, gaussian_pyramid_read = create_gaussian_pyramid_buffers(device, width, height)
+    dog_pyramid, dog_pyramid_read = create_dog_buffers(device, width, height)
     octave_params, scale_params, box_params = create_param_buffers(device, width, height)
     gaussian_bind_group_layout = device.create_bind_group_layout(
         entries=[
@@ -227,6 +271,31 @@ def main() -> None:
         ]
     )
     box_pipeline_layout = device.create_pipeline_layout(bind_group_layouts=[box_bind_group_layout])
+    dog_bind_group_layout = device.create_bind_group_layout(
+        entries=[
+            {
+                "binding": 0,
+                "visibility": wgpu.ShaderStage.COMPUTE,
+                "buffer": {"type": wgpu.BufferBindingType.uniform},
+            },
+            {
+                "binding": 1,
+                "visibility": wgpu.ShaderStage.COMPUTE,
+                "buffer": {"type": wgpu.BufferBindingType.read_only_storage},
+            },
+            {
+                "binding": 2,
+                "visibility": wgpu.ShaderStage.COMPUTE,
+                "buffer": {"type": wgpu.BufferBindingType.read_only_storage},
+            },
+            {
+                "binding": 3,
+                "visibility": wgpu.ShaderStage.COMPUTE,
+                "buffer": {"type": wgpu.BufferBindingType.storage},
+            },
+        ]
+    )
+    dog_pipeline_layout = device.create_pipeline_layout(bind_group_layouts=[dog_bind_group_layout])
     hblur_pipeline = create_compute_pipeline(
         device, "shaders/gaussian.wgsl", "hblur", gaussian_pipeline_layout
     )
@@ -234,6 +303,7 @@ def main() -> None:
         device, "shaders/gaussian.wgsl", "vblur", gaussian_pipeline_layout
     )
     box_pipeline = create_compute_pipeline(device, "shaders/box.wgsl", "main", box_pipeline_layout)
+    dog_pipeline = create_compute_pipeline(device, "shaders/diff.wgsl", "main", dog_pipeline_layout)
     command_encoder = device.create_command_encoder()
     for octave in range(OCTAVES):
         octave_width = max(1, width >> octave)
@@ -247,7 +317,7 @@ def main() -> None:
                     {"binding": 2, "resource": {"buffer": gaussian_pyramid[octave][0]}},
                 ],
             )
-            dispatch_box(command_encoder, box_pipeline, bgroup, octave_width, octave_height)
+            dispatch(command_encoder, box_pipeline, bgroup, octave_width, octave_height)
         else:
             hblur_bgroup = device.create_bind_group(
                 layout=gaussian_bind_group_layout,
@@ -258,9 +328,7 @@ def main() -> None:
                     {"binding": 3, "resource": {"buffer": gaussian_pyramid[0][-1]}},
                 ],
             )
-            dispatch_blur(
-                command_encoder, hblur_pipeline, hblur_bgroup, octave_width, octave_height
-            )
+            dispatch(command_encoder, hblur_pipeline, hblur_bgroup, octave_width, octave_height)
             vblur_bgroup = device.create_bind_group(
                 layout=gaussian_bind_group_layout,
                 entries=[
@@ -270,9 +338,7 @@ def main() -> None:
                     {"binding": 3, "resource": {"buffer": gaussian_pyramid[0][0]}},
                 ],
             )
-            dispatch_blur(
-                command_encoder, vblur_pipeline, vblur_bgroup, octave_width, octave_height
-            )
+            dispatch(command_encoder, vblur_pipeline, vblur_bgroup, octave_width, octave_height)
         for scale in range(1, SCALES + 3):
             hblur_bgroup = device.create_bind_group(
                 layout=gaussian_bind_group_layout,
@@ -283,9 +349,7 @@ def main() -> None:
                     {"binding": 3, "resource": {"buffer": gaussian_pyramid[octave][-1]}},
                 ],
             )
-            dispatch_blur(
-                command_encoder, hblur_pipeline, hblur_bgroup, octave_width, octave_height
-            )
+            dispatch(command_encoder, hblur_pipeline, hblur_bgroup, octave_width, octave_height)
             vblur_bgroup = device.create_bind_group(
                 layout=gaussian_bind_group_layout,
                 entries=[
@@ -295,11 +359,26 @@ def main() -> None:
                     {"binding": 3, "resource": {"buffer": gaussian_pyramid[octave][scale]}},
                 ],
             )
-            dispatch_blur(
-                command_encoder, vblur_pipeline, vblur_bgroup, octave_width, octave_height
+            dispatch(command_encoder, vblur_pipeline, vblur_bgroup, octave_width, octave_height)
+
+    for octave in range(OCTAVES):
+        octave_width = max(1, width >> octave)
+        octave_height = max(1, height >> octave)
+        for scale in range(SCALES + 2):
+            dog_bgroup = device.create_bind_group(
+                layout=dog_bind_group_layout,
+                entries=[
+                    {"binding": 0, "resource": {"buffer": octave_params[octave]}},
+                    {"binding": 1, "resource": {"buffer": gaussian_pyramid[octave][scale + 1]}},
+                    {"binding": 2, "resource": {"buffer": gaussian_pyramid[octave][scale]}},
+                    {"binding": 3, "resource": {"buffer": dog_pyramid[octave][scale]}},
+                ],
             )
+            dispatch(command_encoder, dog_pipeline, dog_bgroup, octave_width, octave_height)
+
     device.queue.submit([command_encoder.finish()])
     save_gaussian_pyramid(device, gaussian_pyramid, gaussian_pyramid_read, width, height)
+    save_dog_pyramid(device, dog_pyramid, dog_pyramid_read, width, height)
 
 
 if __name__ == "__main__":
