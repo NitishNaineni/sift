@@ -1,3 +1,4 @@
 data/
 *.o
 bin/
+__pycache__/
