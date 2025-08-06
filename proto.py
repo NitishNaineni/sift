@@ -211,19 +211,29 @@ def create_keypoints_host(params):
     buffer = cp.cuda.alloc_pinned_memory(total_bytes)
 
     offset = 0
-    positions = np.frombuffer(buffer, dtype=np.float32, count=params.max_keypoints * 2, offset=offset).reshape(params.max_keypoints, 2)
+    positions = np.frombuffer(
+        buffer, dtype=np.float32, count=params.max_keypoints * 2, offset=offset
+    ).reshape(params.max_keypoints, 2)
     offset += positions_nbytes
-    
-    descriptors = np.frombuffer(buffer, dtype=np.uint8, count=params.max_keypoints * 128, offset=offset).reshape(params.max_keypoints, 128)
+
+    descriptors = np.frombuffer(
+        buffer, dtype=np.uint8, count=params.max_keypoints * 128, offset=offset
+    ).reshape(params.max_keypoints, 128)
     offset += descriptors_nbytes
 
-    scales = np.frombuffer(buffer, dtype=np.float32, count=params.max_keypoints, offset=offset)
+    scales = np.frombuffer(
+        buffer, dtype=np.float32, count=params.max_keypoints, offset=offset
+    )
     offset += scales_nbytes
 
-    orientations = np.frombuffer(buffer, dtype=np.float32, count=params.max_keypoints, offset=offset)
+    orientations = np.frombuffer(
+        buffer, dtype=np.float32, count=params.max_keypoints, offset=offset
+    )
     offset += orientations_nbytes
-    
-    osl = np.frombuffer(buffer, dtype=np.int32, count=params.max_keypoints * 2, offset=offset).reshape(params.max_keypoints, 2)
+
+    osl = np.frombuffer(
+        buffer, dtype=np.int32, count=params.max_keypoints * 2, offset=offset
+    ).reshape(params.max_keypoints, 2)
 
     return KeypointsHost(
         positions=positions,
@@ -260,43 +270,75 @@ def mirror(idx, size):
     return ld.min(i_mod, period - 1 - i_mod)
 
 
-@cuda.jit(cache=True)
+@cuda.jit
 def gauss_h(src, dst, w, radius):
+    tile = cuda.shared.array(shape=0, dtype=numba.float32)
     x, y = cuda.grid(2)
+    tx = cuda.threadIdx.x
     h, w_in = src.shape
-    if x >= w_in or y >= h:
-        return
 
-    acc = numba.float32(0.0)
-    for k in range(-radius, radius + 1):
-        xx = mirror(x + k, w_in)
-        acc += src[y, xx] * w[k + radius]
-    dst[y, x] = acc
+    block_size = cuda.blockDim.x
+    tile_w = block_size + 2 * radius
+
+    base_x = cuda.blockIdx.x * block_size - radius
+    for i in range(tx, tile_w, block_size):
+        load_x = base_x + i
+        tile[i] = src[y, mirror(load_x, w_in)]
+
+    cuda.syncthreads()
+
+    if x < w_in and y < h:
+        acc = numba.float32(0.0)
+        for k in range(-radius, radius + 1):
+            acc += tile[tx + radius + k] * w[k + radius]
+        dst[y, x] = acc
 
 
-@cuda.jit(cache=True)
+@cuda.jit
 def gauss_v(src, dst, w, radius):
+    tile = cuda.shared.array(shape=0, dtype=numba.float32)
     x, y = cuda.grid(2)
+    ty = cuda.threadIdx.y
     h_in, w_in = src.shape
-    if x >= w_in or y >= h_in:
-        return
 
-    acc = numba.float32(0.0)
-    for k in range(-radius, radius + 1):
-        yy = mirror(y + k, h_in)
-        acc += src[yy, x] * w[k + radius]
-    dst[y, x] = acc
+    block_size = cuda.blockDim.y
+    tile_h = block_size + 2 * radius
+
+    base_y = cuda.blockIdx.y * block_size - radius
+    for i in range(ty, tile_h, block_size):
+        load_y = base_y + i
+        tile[i] = src[mirror(load_y, h_in), x]
+
+    cuda.syncthreads()
+
+    if x < w_in and y < h_in:
+        acc = numba.float32(0.0)
+        for k in range(-radius, radius + 1):
+            acc += tile[ty + radius + k] * w[k + radius]
+        dst[y, x] = acc
 
 
 def gaussian_blur(img_in, img_out, scratch, weights, radius, stream):
-    block = (32, 8)
-    grid = (
-        (img_in.shape[1] + block[0] - 1) // block[0],
-        (img_in.shape[0] + block[1] - 1) // block[1],
+    threads = 128
+    h_block_dim = (threads,)
+    h_grid_dim = (
+        (img_in.shape[1] + h_block_dim[0] - 1) // h_block_dim[0],
+        img_in.shape[0],
+    )
+    h_shared_mem = (h_block_dim[0] + 2 * radius) * 4
+    gauss_h[h_grid_dim, h_block_dim, stream, h_shared_mem](
+        img_in, scratch, weights, radius
     )
 
-    gauss_h[grid, block, stream](img_in, scratch, weights, radius)
-    gauss_v[grid, block, stream](scratch, img_out, weights, radius)
+    v_block_dim = (1, threads)
+    v_grid_dim = (
+        img_in.shape[1],
+        (img_in.shape[0] + v_block_dim[1] - 1) // v_block_dim[1],
+    )
+    v_shared_mem = (v_block_dim[1] + 2 * radius) * 4
+    gauss_v[v_grid_dim, v_block_dim, stream, v_shared_mem](
+        scratch, img_out, weights, radius
+    )
 
 
 def compute_gss(sift_data, params, o, stream):
@@ -979,7 +1021,7 @@ def compute(sift_data, params, stream):
 
     with nvtx.annotate("set_seed", color="green"):
         set_seed(sift_data, params, stream)
-    
+
         for o in range(params.n_oct):
             with nvtx.annotate(f"Octave {o}"):
                 with nvtx.annotate("GSS"):
@@ -998,7 +1040,6 @@ def compute(sift_data, params, stream):
                 if o < params.n_oct - 1:
                     with nvtx.annotate("Set Next Octave Scale"):
                         set_first_scale(sift_data, params, o + 1, stream)
-
 
 
 def check_runtime_error(err):
