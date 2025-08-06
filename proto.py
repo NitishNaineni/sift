@@ -5,7 +5,7 @@ import os
 import numpy as np
 from PIL import Image
 import cuda.bindings.runtime as runtime
-
+import nvtx
 
 from dataclasses import dataclass, field
 import cupy as cp
@@ -154,6 +154,15 @@ class Keypoints:
 
 
 @dataclass
+class KeypointsHost:
+    positions: np.ndarray
+    descriptors: np.ndarray
+    scales: np.ndarray
+    orientations: np.ndarray
+    osl: np.ndarray
+
+
+@dataclass
 class SiftData:
     input_img: DeviceNDArray
     seed_img: DeviceNDArray
@@ -165,6 +174,7 @@ class SiftData:
     mask: DeviceNDArray
     extrema: Extrema
     keypoints: Keypoints
+    keypoints_host: KeypointsHost
 
 
 def create_extrema(params):
@@ -184,6 +194,46 @@ def create_keypoints(params):
     )
 
 
+def create_keypoints_host(params):
+    positions_nbytes = params.max_keypoints * 2 * np.dtype(np.float32).itemsize
+    descriptors_nbytes = params.max_keypoints * 128 * np.dtype(np.uint8).itemsize
+    scales_nbytes = params.max_keypoints * np.dtype(np.float32).itemsize
+    orientations_nbytes = params.max_keypoints * np.dtype(np.float32).itemsize
+    osl_nbytes = params.max_keypoints * 2 * np.dtype(np.int32).itemsize
+
+    total_bytes = (
+        positions_nbytes
+        + descriptors_nbytes
+        + scales_nbytes
+        + orientations_nbytes
+        + osl_nbytes
+    )
+    buffer = cp.cuda.alloc_pinned_memory(total_bytes)
+
+    offset = 0
+    positions = np.frombuffer(buffer, dtype=np.float32, count=params.max_keypoints * 2, offset=offset).reshape(params.max_keypoints, 2)
+    offset += positions_nbytes
+    
+    descriptors = np.frombuffer(buffer, dtype=np.uint8, count=params.max_keypoints * 128, offset=offset).reshape(params.max_keypoints, 128)
+    offset += descriptors_nbytes
+
+    scales = np.frombuffer(buffer, dtype=np.float32, count=params.max_keypoints, offset=offset)
+    offset += scales_nbytes
+
+    orientations = np.frombuffer(buffer, dtype=np.float32, count=params.max_keypoints, offset=offset)
+    offset += orientations_nbytes
+    
+    osl = np.frombuffer(buffer, dtype=np.int32, count=params.max_keypoints * 2, offset=offset).reshape(params.max_keypoints, 2)
+
+    return KeypointsHost(
+        positions=positions,
+        descriptors=descriptors,
+        scales=scales,
+        orientations=orientations,
+        osl=osl,
+    )
+
+
 # One buffer reused for every octave – octave loop synchronises before reuse
 def create_sift_data(params: SiftParams):
     M, N = params.gss_shapes[0]
@@ -199,6 +249,7 @@ def create_sift_data(params: SiftParams):
         mask=cuda.device_array((params.n_spo + 2, M, N), dtype=np.bool_),
         extrema=create_extrema(params),
         keypoints=create_keypoints(params),
+        keypoints_host=create_keypoints_host(params),
     )
 
 
@@ -894,7 +945,7 @@ def build_descriptors(sift_data, params, o, stream):
     M, N = params.gss_shapes[o]
     gss_oct = sift_data.gss[:, :M, :N]
 
-    threads = 256
+    threads = 8
     blocks = (params.max_keypoints + threads - 1) // threads
 
     descriptor_kernel[blocks, threads, stream](
@@ -911,8 +962,6 @@ def build_descriptors(sift_data, params, o, stream):
 
 
 def compute(sift_data, params, stream):
-    # zero the 2-int buffers on the same stream without allocations
-    # get the **active CuPy stream** that's already being captured
     cur_stream = cp.cuda.get_current_stream()
 
     cp.cuda.runtime.memsetAsync(
@@ -928,19 +977,28 @@ def compute(sift_data, params, stream):
         cur_stream.ptr,
     )
 
-    set_seed(sift_data, params, stream)
-    for o in range(params.n_oct):
-        compute_gss(sift_data, params, o, stream)
-        compute_dog(sift_data, params, o, stream)
+    with nvtx.annotate("set_seed", color="green"):
+        set_seed(sift_data, params, stream)
+    
+        for o in range(params.n_oct):
+            with nvtx.annotate(f"Octave {o}"):
+                with nvtx.annotate("GSS"):
+                    compute_gss(sift_data, params, o, stream)
+                with nvtx.annotate("DoG"):
+                    compute_dog(sift_data, params, o, stream)
+                with nvtx.annotate("Detect Extrema"):
+                    detect_extrema(sift_data, params, o, stream)
+                with nvtx.annotate("Refine Extrema"):
+                    refine_and_filter(sift_data, params, o, stream)
+                with nvtx.annotate("Assign Orientations"):
+                    assign_orientations(sift_data, params, o, stream)
+                with nvtx.annotate("Build Descrptors"):
+                    build_descriptors(sift_data, params, o, stream)
 
-        detect_extrema(sift_data, params, o, stream)
-        refine_and_filter(sift_data, params, o, stream)
+                if o < params.n_oct - 1:
+                    with nvtx.annotate("Set Next Octave Scale"):
+                        set_first_scale(sift_data, params, o + 1, stream)
 
-        assign_orientations(sift_data, params, o, stream)
-        build_descriptors(sift_data, params, o, stream)
-
-        if o < params.n_oct - 1:
-            set_first_scale(sift_data, params, o + 1, stream)
 
 
 def check_runtime_error(err):
@@ -950,81 +1008,135 @@ def check_runtime_error(err):
         raise RuntimeError(f"Runtime error: {err_name} ({err_str})")
 
 
-def build_sift_graph(params):
-    sift_data = create_sift_data(params)
-    cupy_strm = cp.cuda.Stream(non_blocking=True)
-    numba_strm = cuda.external_stream(cupy_strm.ptr)
+class Sift:
+    def __init__(self, params: SiftParams):
+        self.params = params
+        self.sift_data = create_sift_data(self.params)
+        cupy_strm = cp.cuda.Stream(non_blocking=True)
+        numba_strm = cuda.external_stream(cupy_strm.ptr)
 
-    # ---- begin capture ---------------------------------------------
-    with cupy_strm:
-        (err,) = runtime.cudaStreamBeginCapture(
-            cupy_strm.ptr, runtime.cudaStreamCaptureMode.cudaStreamCaptureModeGlobal
-        )
+        with cupy_strm:
+            (err,) = runtime.cudaStreamBeginCapture(
+                cupy_strm.ptr, runtime.cudaStreamCaptureMode.cudaStreamCaptureModeGlobal
+            )
+            check_runtime_error(err)
+
+            compute(self.sift_data, self.params, numba_strm)
+
+            err, self.graph = runtime.cudaStreamEndCapture(cupy_strm.ptr)
+        check_runtime_error(err)
+        err, self.exec_graph = runtime.cudaGraphInstantiate(self.graph, 0)
         check_runtime_error(err)
 
-        compute(sift_data, params, numba_strm)  # <- uses our stream everywhere
+        self.exec_stream = cupy_strm
 
-        err, graph = runtime.cudaStreamEndCapture(cupy_strm.ptr)
-    check_runtime_error(err)
-    err, exec_graph = runtime.cudaGraphInstantiate(graph, 0)
-    check_runtime_error(err)
-    return exec_graph, graph, sift_data, cupy_strm
+    def __del__(self):
+        if runtime:
+            runtime.cudaGraphExecDestroy(self.exec_graph)
+            runtime.cudaGraphDestroy(self.graph)
 
+    def _get_results(self, numba_copy_stream, copy_stream):
+        k = int(
+            self.sift_data.keypoints.counter.copy_to_host(stream=numba_copy_stream)[0]
+        )
+        self.sift_data.keypoints.positions.copy_to_host(
+            self.sift_data.keypoints_host.positions, stream=numba_copy_stream
+        )
+        self.sift_data.keypoints.descriptors.copy_to_host(
+            self.sift_data.keypoints_host.descriptors, stream=numba_copy_stream
+        )
+        self.sift_data.keypoints.scales.copy_to_host(
+            self.sift_data.keypoints_host.scales, stream=numba_copy_stream
+        )
+        self.sift_data.keypoints.orientations.copy_to_host(
+            self.sift_data.keypoints_host.orientations, stream=numba_copy_stream
+        )
+        self.sift_data.keypoints.osl.copy_to_host(
+            self.sift_data.keypoints_host.osl, stream=numba_copy_stream
+        )
+        copy_stream.synchronize()
+        return truncate_keypoints(self.sift_data.keypoints_host, k)
 
-# if __name__ == "__main__":
-#     img = read_img("data/oxford_affine/graf/img1.png")
-#     params = SiftParams(img_dims=img.shape)
+    def process_images(self, image_paths):
+        image_paths = list(image_paths)
+        num_images = len(image_paths)
+        if num_images == 0:
+            return
 
-#     sift_data = create_sift_data(params)
-#     compute(sift_data, params, img)
+        copy_stream = cp.cuda.Stream(non_blocking=True)
+        numba_copy_stream = cuda.external_stream(copy_stream.ptr)
+        img_bytes = (
+            self.params.img_dims[0]
+            * self.params.img_dims[1]
+            * np.dtype(np.float32).itemsize
+        )
+        h_bufs = [cp.cuda.alloc_pinned_memory(img_bytes) for _ in range(2)]
+        events = [cp.cuda.Event() for _ in range(2)]
 
-#     print(sift_data.keypoints.counter.get())
-
-# import matplotlib.pyplot as plt
-
-# plt.imshow(sift_data.dog[0].get())
-# plt.show()
-
-
-if __name__ == "__main__":
-    root = "data/oxford_affine/graf"
-    image_paths = [f"{root}/img{i}.png" for i in range(1, 7)]  # six frames
-
-    # --- size buffers from the first image ---------------------------------
-    first = read_img(image_paths[0])
-    params = SiftParams(img_dims=first.shape)
-
-    exec_graph, graph, sift_data, exec_stream = build_sift_graph(params)
-
-    # host staging buffer (pinned)
-    img_bytes = params.img_dims[0] * params.img_dims[1] * 4  # float32
-    h_buf = cp.cuda.alloc_pinned_memory(img_bytes)
-
-    copy_stream = cp.cuda.Stream(non_blocking=True)
-    copy_done_evt = cp.cuda.Event()
-
-    for pth in image_paths:
-        host_img = read_img(pth).astype(np.float32)
-        np.asarray(h_buf).view(np.float32)[: host_img.size] = host_img.ravel()
-
-        # async H→D
+        # First image
+        host_img = read_img(image_paths[0]).astype(np.float32)
+        np.asarray(h_bufs[0]).view(np.float32)[: host_img.size] = host_img.ravel()
         cp.cuda.runtime.memcpyAsync(
-            int(sift_data.input_img.device_ctypes_pointer.value),  # device dst
-            h_buf.ptr,
+            self.sift_data.input_img.device_ctypes_pointer.value,
+            h_bufs[0].ptr,
             host_img.nbytes,
             runtime.cudaMemcpyKind.cudaMemcpyHostToDevice,
             copy_stream.ptr,
         )
-        copy_stream.record(copy_done_evt)
-        exec_stream.wait_event(copy_done_evt)
+        copy_stream.record(events[0])
+        self.exec_stream.wait_event(events[0])
+        runtime.cudaGraphLaunch(self.exec_graph, self.exec_stream.ptr)
+        self.exec_stream.record(events[0])
 
-        # replay graph
-        runtime.cudaGraphLaunch(exec_graph, exec_stream.ptr)
-        exec_stream.synchronize()
+        for i in range(1, num_images):
+            current_buffer_idx = i % 2
+            prev_buffer_idx = (i - 1) % 2
 
-        k = int(sift_data.keypoints.counter.copy_to_host()[0])
-        print(f"{pth}: {k} keypoints")
+            next_host_img = read_img(image_paths[i]).astype(np.float32)
 
-    # ---- tidy up ----------------------------------------------------------
-    runtime.cudaGraphExecDestroy(exec_graph)
-    runtime.cudaGraphDestroy(graph)
+            events[prev_buffer_idx].synchronize()
+
+            yield self._get_results(numba_copy_stream, copy_stream)
+
+            np.asarray(h_bufs[current_buffer_idx]).view(np.float32)[
+                : next_host_img.size
+            ] = next_host_img.ravel()
+            cp.cuda.runtime.memcpyAsync(
+                self.sift_data.input_img.device_ctypes_pointer.value,
+                h_bufs[current_buffer_idx].ptr,
+                next_host_img.nbytes,
+                runtime.cudaMemcpyKind.cudaMemcpyHostToDevice,
+                copy_stream.ptr,
+            )
+            copy_stream.record(events[current_buffer_idx])
+            self.exec_stream.wait_event(events[current_buffer_idx])
+            runtime.cudaGraphLaunch(self.exec_graph, self.exec_stream.ptr)
+            self.exec_stream.record(events[current_buffer_idx])
+
+        # Final image
+        final_buffer_idx = (num_images - 1) % 2
+        events[final_buffer_idx].synchronize()
+        yield self._get_results(numba_copy_stream, copy_stream)
+
+
+def truncate_keypoints(kp_host: KeypointsHost, num_keypoints: int):
+    return KeypointsHost(
+        positions=kp_host.positions[:num_keypoints],
+        descriptors=kp_host.descriptors[:num_keypoints],
+        scales=kp_host.scales[:num_keypoints],
+        orientations=kp_host.orientations[:num_keypoints],
+        osl=kp_host.osl[:num_keypoints],
+    )
+
+
+if __name__ == "__main__":
+    root = "data/oxford_affine/graf"
+    image_paths = [f"{root}/img{i}.png" for i in range(1, 7)]
+
+    # --- 1. Initial Setup ---
+    first_img_for_setup = read_img(image_paths[0])
+    params = SiftParams(img_dims=first_img_for_setup.shape)
+    sift = Sift(params)
+
+    for i, keypoints in enumerate(sift.process_images(image_paths)):
+        print(f"{image_paths[i]}: {len(keypoints.positions)} keypoints")
