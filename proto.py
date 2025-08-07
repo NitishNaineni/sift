@@ -5,7 +5,6 @@ import os
 import numpy as np
 from PIL import Image
 import cuda.bindings.runtime as runtime
-import nvtx
 
 from dataclasses import dataclass, field
 import cupy as cp
@@ -39,10 +38,6 @@ def read_img(path):
         [0.212639005871510, 0.715168678767756, 0.072192315360734], dtype=np.float32
     )
     return img
-
-
-def _stream_ptr(st):
-    return st.ptr if hasattr(st, "ptr") else st.handle.value
 
 
 def _gauss_kernel(sigma: float, dtype=np.float32):
@@ -166,12 +161,11 @@ class KeypointsHost:
 class SiftData:
     input_img: DeviceNDArray
     seed_img: DeviceNDArray
-    scratch: DeviceNDArray
-    gss: DeviceNDArray
-    dog: DeviceNDArray
-    maxf: DeviceNDArray
-    minf: DeviceNDArray
-    mask: DeviceNDArray
+    scratch: list[DeviceNDArray]
+    gss: list[DeviceNDArray]
+    dog: list[DeviceNDArray]
+    grad_mag: list[DeviceNDArray]
+    grad_ang: list[DeviceNDArray]
     extrema: Extrema
     keypoints: Keypoints
     keypoints_host: KeypointsHost
@@ -244,23 +238,47 @@ def create_keypoints_host(params):
     )
 
 
-# One buffer reused for every octave – octave loop synchronises before reuse
-def create_sift_data(params: SiftParams):
-    M, N = params.gss_shapes[0]
+def _alloc_octave_tensors(params: SiftParams, o: int):
+    M, N = params.gss_shapes[o]
+    n_g = params.n_spo + 3
+    n_d = params.n_spo + 2
+    gss = cuda.device_array((n_g, M, N), np.float32)
+    dog = cuda.device_array((n_d, M, N), np.float32)
+    scratch = cuda.device_array((M, N), np.float32)
+    grad_mag = cuda.device_array((n_g, M, N), np.float32)
+    grad_ang = cuda.device_array((n_g, M, N), np.float32)
+    return gss, dog, scratch, grad_mag, grad_ang
 
+
+def create_sift_data(params: SiftParams) -> SiftData:
+    gss, dog, scratch, grad_mag, grad_ang = zip(
+        *(_alloc_octave_tensors(params, o) for o in range(params.n_oct))
+    )
+
+    M0, N0 = params.gss_shapes[0]
     return SiftData(
-        input_img=cuda.device_array(params.img_dims, dtype=np.float32),
-        seed_img=cuda.device_array((M, N), dtype=np.float32),
-        scratch=cuda.device_array((M, N), dtype=np.float32),
-        gss=cuda.device_array((params.n_spo + 3, M, N), dtype=np.float32),
-        dog=cuda.device_array((params.n_spo + 2, M, N), dtype=np.float32),
-        maxf=cuda.device_array((params.n_spo + 2, M, N), dtype=np.float32),
-        minf=cuda.device_array((params.n_spo + 2, M, N), dtype=np.float32),
-        mask=cuda.device_array((params.n_spo + 2, M, N), dtype=np.bool_),
+        input_img=cuda.device_array(params.img_dims, np.float32),
+        seed_img=cuda.device_array((M0, N0), np.float32),
+        scratch=scratch,
+        gss=gss,
+        dog=dog,
+        grad_mag=grad_mag,
+        grad_ang=grad_ang,
         extrema=create_extrema(params),
         keypoints=create_keypoints(params),
         keypoints_host=create_keypoints_host(params),
     )
+
+
+@cuda.jit(cache=True, fastmath=True)
+def gradient_kernel(img, mag, ang):
+    x, y = cuda.grid(2)
+    H, W = img.shape
+    if 0 < x < W - 1 and 0 < y < H - 1:
+        gx = 0.5 * (img[y, x + 1] - img[y, x - 1])
+        gy = 0.5 * (img[y + 1, x] - img[y - 1, x])
+        mag[y, x] = ld.sqrtf(gx * gx + gy * gy)
+        ang[y, x] = wrap_angle(ld.atan2f(gy, gx))
 
 
 @cuda.jit(device=True, inline=True, cache=True)
@@ -341,14 +359,24 @@ def gaussian_blur(img_in, img_out, scratch, weights, radius, stream):
     )
 
 
+def launch_gradient_kernel(src, dst_mag, dst_ang, stream):
+    H, W = src.shape
+    threads = (16, 16)  # 256 threads, *no* z-dim
+    grid = ((W + 15) // 16, (H + 15) // 16)
+    gradient_kernel[grid, threads, stream](src, dst_mag, dst_ang)
+
+
 def compute_gss(sift_data, params, o, stream):
-    M, N = params.gss_shapes[o]
-    gss = sift_data.gss[:, :M, :N]
-    scratch = sift_data.scratch[:M, :N]
+    gss = sift_data.gss[o]
+    grad_mag = sift_data.grad_mag[o]
+    grad_ang = sift_data.grad_ang[o]
+    scratch = sift_data.scratch[o]
+
     num_scales = params.n_spo + 3
     kernels_per_o = num_scales - 1
-
     base_k_idx = o * kernels_per_o
+
+    launch_gradient_kernel(gss[0], grad_mag[0], grad_ang[0], stream)
 
     for s in range(1, num_scales):
         k_idx = base_k_idx + (s - 1)
@@ -357,25 +385,39 @@ def compute_gss(sift_data, params, o, stream):
 
         gaussian_blur(gss[s - 1], gss[s], scratch, w, r, stream)
 
+        launch_gradient_kernel(gss[s], grad_mag[s], grad_ang[s], stream)
+
 
 @cuda.jit(cache=True)
 def dog_diff_kernel(gss_in, dog_out):
-    s, y, x = cuda.grid(3)
+    s_base = cuda.blockIdx.z * cuda.blockDim.z
+    s_local = cuda.threadIdx.z
+    s = s_base + s_local
+
+    y = cuda.blockIdx.y * cuda.blockDim.y + cuda.threadIdx.y
+    x = cuda.blockIdx.x * cuda.blockDim.x + cuda.threadIdx.x
+
     ns, H, W = dog_out.shape
+
     if s < ns and y < H and x < W:
         dog_out[s, y, x] = gss_in[s + 1, y, x] - gss_in[s, y, x]
 
 
 def compute_dog(sift_data, params, o, stream):
+    gss = sift_data.gss[o]
+    dog = sift_data.dog[o]
+
     M, N = params.gss_shapes[o]
-    gss = sift_data.gss[:, :M, :N]
-    dog = sift_data.dog[:, :M, :N]
-    threads = (1, 8, 8)
+
+    num_dog_images = params.n_spo + 2
+    threads = (4, 16, 4)
+
     grids = (
-        (params.n_spo + 2 + threads[0] - 1) // threads[0],
-        (M + threads[1] - 1) // threads[1],
-        (N + threads[2] - 1) // threads[2],
+        (N + threads[2] - 1) // threads[2],  # Grid X
+        (M + threads[1] - 1) // threads[1],  # Grid Y
+        (num_dog_images + threads[0] - 1) // threads[0],  # Grid Z
     )
+
     dog_diff_kernel[grids, threads, stream](gss, dog)
 
 
@@ -423,8 +465,8 @@ def set_seed(sift_data, params, stream):
 
     gaussian_blur(
         sift_data.seed_img,
-        sift_data.gss[0],
-        sift_data.scratch,
+        sift_data.gss[0][0],
+        sift_data.scratch[0],
         params.seed_kernel,
         params.seed_radius,
         stream,
@@ -440,11 +482,10 @@ def downsample_kernel(src, dst):
 
 
 def set_first_scale(sift_data, params, o, stream):
-    M, N = params.gss_shapes[o]
-    M_pre, N_pre = params.gss_shapes[o - 1]
+    src = sift_data.gss[o - 1][params.n_spo]
+    dst = sift_data.gss[o][0]
 
-    src = sift_data.gss[params.n_spo, :M_pre, :N_pre]
-    dst = sift_data.gss[0, :M, :N]
+    M, N = params.gss_shapes[o]
 
     threads = (16, 16)
     grid = ((N + threads[1] - 1) // threads[1], (M + threads[0] - 1) // threads[0])
@@ -489,9 +530,6 @@ def find_and_record_extrema_kernel(
                 if not is_max and not is_min:
                     return
 
-    if not (is_max or is_min):
-        return
-
     idx = cuda.atomic.add(counter, 0, 1)
     if idx >= max_extrema:
         cuda.atomic.add(counter, 1, 1)
@@ -517,8 +555,8 @@ def detect_extrema(sift_data, params, o, stream):
         stream.handle.value,
     )
 
+    dog_o = sift_data.dog[o]
     M, N = params.gss_shapes[o]
-    dog_o = sift_data.dog[:, :M, :N]
 
     threads = (2, 8, 8)
     blocks = (
@@ -602,6 +640,10 @@ def refine_filter_kernel(
 
     valid = False
     for _ in range(5):
+        if not (1 <= s < num_s - 1 and 1 <= y < H - 1 and 1 <= x < W - 1):
+            int_buffer[idx, 0] = -1  # mark as rejected so later kernels skip it
+            return
+
         g[0] = 0.5 * (dog_octave[s + 1, y, x] - dog_octave[s - 1, y, x])
         g[1] = 0.5 * (dog_octave[s, y + 1, x] - dog_octave[s, y - 1, x])
         g[2] = 0.5 * (dog_octave[s, y, x + 1] - dog_octave[s, y, x - 1])
@@ -687,8 +729,7 @@ def refine_filter_kernel(
 
 
 def refine_and_filter(sift_data, params, o, stream):
-    M, N = params.gss_shapes[o]
-    dog_oct = sift_data.dog[:, :M, :N]
+    dog_oct = sift_data.dog[o]
 
     threads = 128
     blocks = (params.max_extrema + threads - 1) // threads
@@ -714,136 +755,132 @@ def wrap_angle(theta: numba.float32) -> numba.float32:
     return ld.fmodf(ld.fmodf(theta, TWO_PI) + TWO_PI, TWO_PI)
 
 
-@cuda.jit(cache=True)
-def orientation_kernel(
-    gss_octave,
+TX, TY = 16, 16  # 256 threads / block
+
+
+@cuda.jit(cache=True, fastmath=True)
+def orientation_kernel_blockperkp(
+    grad_mag,
+    grad_ang,  # ← reuse gradients
     int_buf,
     float_buf,
-    extrema_count,
+    n_extrema,
     key_pos,
     key_scale,
     key_ori,
     key_osl,
-    counter,
-    o,
+    kp_counter,
+    oct_idx,
     lambda_ori,
     delta_min,
 ):
-    nbins = 36
-    two_pi = numba.float32(6.28318530718)
-    bin_w = two_pi / nbins
-
-    idx = cuda.grid(1)
-    if idx >= extrema_count[0]:
+    kp_idx = cuda.blockIdx.x  # one block ↔ one keypoint
+    if kp_idx >= n_extrema[0]:
+        return
+    if int_buf[kp_idx, 0] != oct_idx:
         return
 
-    if int_buf[idx, 0] != o:
-        return
+    # ------------- constants for this keypoint -------------
+    s = int_buf[kp_idx, 1]
+    yy0 = int_buf[kp_idx, 2]
+    xx0 = int_buf[kp_idx, 3]
 
-    s = int_buf[idx, 1]
-    y_g = int_buf[idx, 2]
-    x_g = int_buf[idx, 3]
-
-    sigma_world = float_buf[idx, 2]
-    scale_factor = delta_min * (1 << o)
-    sigma_oct = sigma_world / scale_factor
+    sigma_w = float_buf[kp_idx, 2]
+    scale = delta_min * (1 << oct_idx)
+    sigma_oct = sigma_w / scale
 
     radius = int(3.0 * lambda_ori * sigma_oct + 0.5)
-    if radius == 0:
-        radius = 1
+    radius = 1 if radius == 0 else radius
 
-    H, W = gss_octave.shape[1], gss_octave.shape[2]
+    H, W = grad_mag.shape[1:]
     if (
-        y_g - radius < 1
-        or y_g + radius >= H - 1
-        or x_g - radius < 1
-        or x_g + radius >= W - 1
+        yy0 - radius < 1
+        or yy0 + radius >= H - 1
+        or xx0 - radius < 1
+        or xx0 + radius >= W - 1
     ):
         return
 
-    hist = cuda.local.array(nbins, dtype=numba.float32)
-    tmp_hist = cuda.local.array(nbins, dtype=numba.float32)
-    for i in range(nbins):
-        hist[i] = 0.0
-
     g_sigma = lambda_ori * sigma_oct
     inv_2sig2 = 1.0 / (2.0 * g_sigma * g_sigma)
+    bin_scale = numba.float32(36.0 / 6.28318530718)  # 36 / 2π
 
-    for dy in range(-radius, radius + 1):
-        for dx in range(-radius, radius + 1):
-            y = y_g + dy
-            x = x_g + dx
+    # ------------- shared 36-bin histogram -------------
+    hist = cuda.shared.array(36, numba.float32)
+    tflat = cuda.threadIdx.y * TX + cuda.threadIdx.x
+    if tflat < 36:
+        hist[tflat] = 0.0
+    cuda.syncthreads()
 
-            gx = (gss_octave[s, y, x + 1] - gss_octave[s, y, x - 1]) * 0.5
-            gy = (gss_octave[s, y + 1, x] - gss_octave[s, y - 1, x]) * 0.5
-            mag = ld.sqrtf(gx * gx + gy * gy)
+    # ------------- sweep patch -------------
+    for dy in range(cuda.threadIdx.y, radius * 2 + 1, TY):
+        yy = yy0 - radius + dy
+        dyf = yy - yy0
+        for dx in range(cuda.threadIdx.x, radius * 2 + 1, TX):
+            xx = xx0 - radius + dx
+            dxf = xx - xx0
+
+            mag = grad_mag[s, yy, xx]
             if mag == 0.0:
                 continue
 
-            ang = wrap_angle(ld.atan2f(gy, gx))
-            weight = mag * ld.expf(-(dx * dx + dy * dy) * inv_2sig2)
+            ang = wrap_angle(grad_ang[s, yy, xx])
+            w = mag * ld.expf(-(dxf * dxf + dyf * dyf) * inv_2sig2)
+            bin_idx = int(ang * bin_scale + 0.5) % 36
+            cuda.atomic.add(hist, bin_idx, w)
 
-            bin_idx = int(ang / bin_w + 0.5) % nbins
-            hist[bin_idx] += weight
+    cuda.syncthreads()
 
-    for _ in range(6):
-        for i in range(nbins):
-            tmp_hist[i] = hist[i]
-        for i in range(nbins):
-            hist[i] = (
-                tmp_hist[(i - 1) % nbins] + tmp_hist[i] + tmp_hist[(i + 1) % nbins]
-            ) / 3.0
+    # ------------- smoothing + peak-picking -------------
+    if tflat == 0:
+        tmp = cuda.local.array(36, numba.float32)
+        for _ in range(6):  # 6× circular box-smooth
+            for i in range(36):
+                tmp[i] = hist[i]
+            for i in range(36):
+                hist[i] = (tmp[(i - 1) % 36] + tmp[i] + tmp[(i + 1) % 36]) / 3.0
 
-    max_val = numba.float32(0.0)
-    for i in range(nbins):
-        if hist[i] > max_val:
-            max_val = hist[i]
-    if max_val == 0.0:
-        return
-
-    thresh = 0.8 * max_val
-    eps_denom = 1e-9 * max_val
-
-    for i in range(nbins):
-        prev = hist[(i - 1) % nbins]
-        curr = hist[i]
-        nxt = hist[(i + 1) % nbins]
-
-        if curr < thresh or curr <= prev or curr <= nxt:
-            continue
-
-        denom = prev - 2.0 * curr + nxt
-        if ld.fabsf(denom) < eps_denom:
-            continue
-
-        offset = (prev - nxt) / (2.0 * denom)
-        if ld.fabsf(offset) > 1.0:
-            offset = 0.0
-
-        theta = wrap_angle((i + offset) * bin_w)
-
-        kp_idx = cuda.atomic.add(counter, 0, 1)
-        if kp_idx >= key_pos.shape[0]:
-            cuda.atomic.add(counter, 1, 1)
+        # max + threshold
+        vmax = numba.float32(0.0)
+        for i in range(36):
+            vmax = vmax if vmax > hist[i] else hist[i]
+        if vmax == 0.0:
             return
+        thresh = 0.8 * vmax
+        eps = 1e-9 * vmax
 
-        key_pos[kp_idx, 0] = float_buf[idx, 1]  # x
-        key_pos[kp_idx, 1] = float_buf[idx, 0]  # y
-        key_scale[kp_idx] = sigma_world
-        key_ori[kp_idx] = theta
-        key_osl[kp_idx, 0] = o
-        key_osl[kp_idx, 1] = s
+        for i in range(36):
+            prev, cur, nxt = hist[(i - 1) % 36], hist[i], hist[(i + 1) % 36]
+            if cur < thresh or cur <= prev or cur <= nxt:
+                continue
+            denom = prev - 2.0 * cur + nxt
+            if ld.fabsf(denom) < eps:
+                continue
+            offset = (prev - nxt) / (2.0 * denom)
+            offset = 0.0 if ld.fabsf(offset) > 1.0 else offset
+            theta = wrap_angle((i + offset) * (6.28318530718 / 36.0))
+
+            out_idx = cuda.atomic.add(kp_counter, 0, 1)
+            if out_idx >= key_pos.shape[0]:
+                cuda.atomic.add(kp_counter, 0, -1)
+                cuda.atomic.add(kp_counter, 1, 1)
+                return
+
+            key_pos[out_idx, 0] = float_buf[kp_idx, 1]  # x
+            key_pos[out_idx, 1] = float_buf[kp_idx, 0]  # y
+            key_scale[out_idx] = sigma_w
+            key_ori[out_idx] = theta
+            key_osl[out_idx, 0] = oct_idx
+            key_osl[out_idx, 1] = s
 
 
 def assign_orientations(sift_data, params, o, stream):
-    M, N = params.gss_shapes[o]
-    gss_oct = sift_data.gss[:, :M, :N]
+    blocks = (params.max_extrema,)  # one block per candidate
+    threads = (TX, TY)
 
-    threads = 256
-    blocks = (params.max_extrema + threads - 1) // threads
-
-    orientation_kernel[blocks, threads, stream](
-        gss_oct,
+    orientation_kernel_blockperkp[blocks, threads, stream](
+        sift_data.grad_mag[o],  # grad magnitude
+        sift_data.grad_ang[o],  # grad angle
         sift_data.extrema.int_buffer,
         sift_data.extrema.float_buffer,
         sift_data.extrema.counter,
@@ -865,92 +902,92 @@ NHIST2 = NHIST * NHIST
 DESC_LEN = NHIST2 * NORIBIN
 
 
-@cuda.jit(cache=True)
-def descriptor_kernel(
-    gss_octave,
-    key_pos,
-    key_scale,
-    key_ori,
+TX, TY = 16, 16  # 256 threads / block  → good occupancy
+
+
+@cuda.jit(cache=True, fastmath=True)
+def descriptor_kernel_blockperkp(
+    grad_mag,
+    grad_ang,
+    kpos,
+    kscale,
+    kori,
     osl,
-    counter,
-    descriptors,
-    octave_idx,
+    kctr,  # same device counter array
+    desc,
+    oct_idx,
     delta_min,
 ):
-    two_pi = numba.float32(6.28318530718)
-    idx = cuda.grid(1)
-    if idx >= counter[0]:
+    kp_idx = cuda.blockIdx.x  # one block == one keypoint
+    if kp_idx >= kctr[0]:
         return
-    if osl[idx, 0] != octave_idx:
-        return
-    if idx >= descriptors.shape[0]:
+    if osl[kp_idx, 0] != oct_idx:
         return
 
-    s = osl[idx, 1]
-    x_w = key_pos[idx, 0]
-    y_w = key_pos[idx, 1]
-    sigma = key_scale[idx]
-    theta = key_ori[idx]
+    # ---------- per-keypoint constants ----------
+    s = osl[kp_idx, 1]
+    x_w, y_w = kpos[kp_idx]
+    sigma = kscale[kp_idx]
+    theta0 = kori[kp_idx]
 
-    scale_factor = delta_min * (1 << octave_idx)
-    x0 = x_w / scale_factor
-    y0 = y_w / scale_factor
+    scale = delta_min * (1 << oct_idx)
+    x0, y0 = x_w / scale, y_w / scale  # octave coords
 
-    d_min = ld.ceilf(ld.sqrtf(numba.float32(2.0)) * LAMBDA_DESC * sigma / scale_factor)
+    radiusF = LAMBDA_DESC * sigma / scale
+    radius = int(radiusF + 0.5)
+    radius = 1 if radius < 1 else radius
+    dmin = ld.ceilf(ld.sqrtf(2.0) * radius)
 
-    H, W = gss_octave.shape[1], gss_octave.shape[2]
-    if x0 < d_min or x0 > (W - 1 - d_min) or y0 < d_min or y0 > (H - 1 - d_min):
+    H, W = grad_mag.shape[1:]
+    if x0 < dmin or x0 > W - 1 - dmin or y0 < dmin or y0 > H - 1 - dmin:
         return
 
-    cos_t = ld.cosf(theta)
-    sin_t = ld.sinf(theta)
+    cos_t, sin_t = ld.cosf(theta0), ld.sinf(theta0)
+    inv_2sig2 = 1.0 / (2.0 * radiusF * radiusF)
+    bin_scale = NORIBIN / 6.28318530718  # 2π
+    patch_size = radius * 2 + 1  # side length in px
 
-    g_sigma = LAMBDA_DESC * sigma / scale_factor
-    inv_2sig2 = 1.0 / (2.0 * g_sigma * g_sigma)
-    bin_scale = numba.float32(NORIBIN) / two_pi
-    radius_px = int(LAMBDA_DESC * sigma / scale_factor + 0.5)
-    if radius_px < 1:
-        radius_px = 1
+    # ---------- shared histogram ----------
+    hist = cuda.shared.array(DESC_LEN, numba.float32)
 
-    hist = cuda.local.array(DESC_LEN, dtype=numba.float32)
-    for i in range(DESC_LEN):
-        hist[i] = 0.0
+    # zero the shared array (first 128 threads of the block)
+    tflat = cuda.threadIdx.y * TX + cuda.threadIdx.x
+    if tflat < DESC_LEN:
+        hist[tflat] = 0.0
+    cuda.syncthreads()
 
-    H, W = gss_octave.shape[1], gss_octave.shape[2]
-    y_min = max(1, int(y0 - radius_px))
-    y_max = min(H - 2, int(y0 + radius_px))
-    x_min = max(1, int(x0 - radius_px))
-    x_max = min(W - 2, int(x0 + radius_px))
+    # ---------- sweep the rotated patch ----------
+    # Each thread walks over the square in strides of blockDim.xy
+    for py in range(cuda.threadIdx.y, patch_size, TY):
+        yy = int(y0) - radius + py
+        dy0 = yy - y0
+        for px in range(cuda.threadIdx.x, patch_size, TX):
+            xx = int(x0) - radius + px
+            dx0 = xx - x0
 
-    for yy in range(y_min, y_max + 1):
-        for xx in range(x_min, x_max + 1):
-            dx = (xx - x0) * cos_t + (yy - y0) * sin_t
-            dy = -(xx - x0) * sin_t + (yy - y0) * cos_t
-            u = dx / (radius_px * 2) * NHIST + NHIST / 2 - 0.5
-            v = dy / (radius_px * 2) * NHIST + NHIST / 2 - 0.5
+            # rotate into keypoint frame
+            dx = dx0 * cos_t + dy0 * sin_t
+            dy = -dx0 * sin_t + dy0 * cos_t
+            u = dx / (radius * 2) * NHIST + (NHIST * 0.5 - 0.5)
+            v = dy / (radius * 2) * NHIST + (NHIST * 0.5 - 0.5)
             if u < -1 or u > NHIST or v < -1 or v > NHIST:
                 continue
 
-            if xx <= 0 or xx >= W - 1 or yy <= 0 or yy >= H - 1:
-                continue
-
-            gx = 0.5 * (gss_octave[s, yy, xx + 1] - gss_octave[s, yy, xx - 1])
-            gy = 0.5 * (gss_octave[s, yy + 1, xx] - gss_octave[s, yy - 1, xx])
-            mag = ld.sqrtf(gx * gx + gy * gy)
+            mag = grad_mag[s, yy, xx]
             if mag == 0.0:
                 continue
 
-            ang = wrap_angle(ld.atan2f(gy, gx) - theta)
+            ang = wrap_angle(grad_ang[s, yy, xx] - theta0)
             o_bin = ang * bin_scale
-
             u0 = int(ld.floorf(u))
             du = u - u0
             v0 = int(ld.floorf(v))
             dv = v - v0
             o0 = int(ld.floorf(o_bin))
             do = o_bin - o0
-
             w_base = mag * ld.expf(-(dx * dx + dy * dy) * inv_2sig2)
+
+            # trilinear vote, atomics into shared memory
             for iu in (0, 1):
                 uu = u0 + iu
                 if 0 <= uu < NHIST:
@@ -962,36 +999,40 @@ def descriptor_kernel(
                             for io in (0, 1):
                                 oo = (o0 + io) & (NORIBIN - 1)
                                 wo = (1 - do) if io == 0 else do
-                                w = w_base * wu * wv * wo
-                                idx_hist = (vv * NHIST + uu) * NORIBIN + oo
-                                hist[idx_hist] += w
+                                hidx = ((vv * NHIST + uu) * NORIBIN) + oo
+                                cuda.atomic.add(hist, hidx, w_base * wu * wv * wo)
 
-    l2 = numba.float32(0.0)
-    for i in range(DESC_LEN):
-        l2 += hist[i] * hist[i]
-    l2 = ld.sqrtf(l2) + 1e-7
-    for i in range(DESC_LEN):
-        hist[i] /= l2
-        if hist[i] > 0.2:
-            hist[i] = 0.2
-    l2 = numba.float32(0.0)
-    for i in range(DESC_LEN):
-        l2 += hist[i] * hist[i]
-    l2 = ld.sqrtf(l2) + 1e-7
-    for i in range(DESC_LEN):
-        val = hist[i] / l2 * 512.0
-        descriptors[idx, i] = numba.uint8(255 if val > 255 else int(val + 0.5))
+    cuda.syncthreads()
+
+    # ---------- normalise, clamp, quantise ----------
+    if tflat == 0:  # single thread does the maths
+        l2 = numba.float32(0.0)
+        for i in range(DESC_LEN):
+            l2 += hist[i] * hist[i]
+        l2 = ld.rsqrtf(l2 + 1e-7)
+
+        l2p = numba.float32(0.0)
+        for i in range(DESC_LEN):
+            v = hist[i] * l2
+            if v > 0.2:
+                v = 0.2
+            hist[i] = v
+            l2p += v * v
+        l2p = ld.rsqrtf(l2p + 1e-7)
+
+        for i in range(DESC_LEN):
+            q = hist[i] * l2p * 512.0
+            desc[kp_idx, i] = numba.uint8(255 if q > 255 else int(q + 0.5))
 
 
 def build_descriptors(sift_data, params, o, stream):
-    M, N = params.gss_shapes[o]
-    gss_oct = sift_data.gss[:, :M, :N]
-
-    threads = 8
-    blocks = (params.max_keypoints + threads - 1) // threads
-
-    descriptor_kernel[blocks, threads, stream](
-        gss_oct,
+    threads = (TX, TY)
+    # launch as many blocks as the *maximum* possible keypoints; extra
+    # blocks exit immediately if kp_idx ≥ counter[0]
+    blocks = (params.max_keypoints,)
+    descriptor_kernel_blockperkp[blocks, threads, stream](
+        sift_data.grad_mag[o],
+        sift_data.grad_ang[o],
         sift_data.keypoints.positions,
         sift_data.keypoints.scales,
         sift_data.keypoints.orientations,
@@ -1004,42 +1045,31 @@ def build_descriptors(sift_data, params, o, stream):
 
 
 def compute(sift_data, params, stream):
-    cur_stream = cp.cuda.get_current_stream()
-
     cp.cuda.runtime.memsetAsync(
         int(sift_data.keypoints.counter.device_ctypes_pointer.value),
         0,
         sift_data.keypoints.counter.nbytes,
-        cur_stream.ptr,
+        stream.handle.value,
     )
     cp.cuda.runtime.memsetAsync(
         int(sift_data.extrema.counter.device_ctypes_pointer.value),
         0,
         sift_data.extrema.counter.nbytes,
-        cur_stream.ptr,
+        stream.handle.value,
     )
 
-    with nvtx.annotate("set_seed", color="green"):
-        set_seed(sift_data, params, stream)
+    set_seed(sift_data, params, stream)
 
-        for o in range(params.n_oct):
-            with nvtx.annotate(f"Octave {o}"):
-                with nvtx.annotate("GSS"):
-                    compute_gss(sift_data, params, o, stream)
-                with nvtx.annotate("DoG"):
-                    compute_dog(sift_data, params, o, stream)
-                with nvtx.annotate("Detect Extrema"):
-                    detect_extrema(sift_data, params, o, stream)
-                with nvtx.annotate("Refine Extrema"):
-                    refine_and_filter(sift_data, params, o, stream)
-                with nvtx.annotate("Assign Orientations"):
-                    assign_orientations(sift_data, params, o, stream)
-                with nvtx.annotate("Build Descrptors"):
-                    build_descriptors(sift_data, params, o, stream)
+    for o in range(params.n_oct):
+        compute_gss(sift_data, params, o, stream)
+        compute_dog(sift_data, params, o, stream)
+        detect_extrema(sift_data, params, o, stream)
+        refine_and_filter(sift_data, params, o, stream)
+        assign_orientations(sift_data, params, o, stream)
+        build_descriptors(sift_data, params, o, stream)
 
-                if o < params.n_oct - 1:
-                    with nvtx.annotate("Set Next Octave Scale"):
-                        set_first_scale(sift_data, params, o + 1, stream)
+        if o < params.n_oct - 1:
+            set_first_scale(sift_data, params, o + 1, stream)
 
 
 def check_runtime_error(err):
@@ -1050,29 +1080,39 @@ def check_runtime_error(err):
 
 
 class Sift:
-    def __init__(self, params: SiftParams):
+    def __init__(self, params: SiftParams, use_graph: bool = True):
         self.params = params
+        self.use_graph = use_graph
         self.sift_data = create_sift_data(self.params)
-        cupy_strm = cp.cuda.Stream(non_blocking=True)
-        numba_strm = cuda.external_stream(cupy_strm.ptr)
 
-        with cupy_strm:
-            (err,) = runtime.cudaStreamBeginCapture(
-                cupy_strm.ptr, runtime.cudaStreamCaptureMode.cudaStreamCaptureModeGlobal
-            )
+        self.exec_stream = cp.cuda.Stream(non_blocking=True)
+
+        if self.use_graph:
+            numba_strm = cuda.external_stream(self.exec_stream.ptr)
+
+            with self.exec_stream:
+                (err,) = runtime.cudaStreamBeginCapture(
+                    self.exec_stream.ptr,
+                    runtime.cudaStreamCaptureMode.cudaStreamCaptureModeGlobal,
+                )
+                check_runtime_error(err)
+
+                compute(self.sift_data, self.params, numba_strm)
+
+                err, self.graph = runtime.cudaStreamEndCapture(self.exec_stream.ptr)
+            check_runtime_error(err)
+            err, self.exec_graph = runtime.cudaGraphInstantiate(self.graph, 0)
             check_runtime_error(err)
 
-            compute(self.sift_data, self.params, numba_strm)
-
-            err, self.graph = runtime.cudaStreamEndCapture(cupy_strm.ptr)
-        check_runtime_error(err)
-        err, self.exec_graph = runtime.cudaGraphInstantiate(self.graph, 0)
-        check_runtime_error(err)
-
-        self.exec_stream = cupy_strm
+            # Warm-up compile to move JIT & cudaMalloc cost out of measured region
+            with self.exec_stream:
+                compute(self.sift_data, self.params, numba_strm)
+            cp.cuda.get_current_stream().synchronize()
+        else:
+            self.numba_exec_stream = cuda.external_stream(self.exec_stream.ptr)
 
     def __del__(self):
-        if runtime:
+        if runtime and self.use_graph:
             runtime.cudaGraphExecDestroy(self.exec_graph)
             runtime.cudaGraphDestroy(self.graph)
 
@@ -1126,7 +1166,10 @@ class Sift:
         )
         copy_stream.record(events[0])
         self.exec_stream.wait_event(events[0])
-        runtime.cudaGraphLaunch(self.exec_graph, self.exec_stream.ptr)
+        if self.use_graph:
+            runtime.cudaGraphLaunch(self.exec_graph, self.exec_stream.ptr)
+        else:
+            compute(self.sift_data, self.params, self.numba_exec_stream)
         self.exec_stream.record(events[0])
 
         for i in range(1, num_images):
@@ -1135,7 +1178,11 @@ class Sift:
 
             next_host_img = read_img(image_paths[i]).astype(np.float32)
 
-            events[prev_buffer_idx].synchronize()
+            # Remove explicit sync - let kernels of img i run while we copy img i+1
+            # events[prev_buffer_idx].synchronize()
+
+            # *** NEW *** - make sure all work for image i-1 is finished on the GPU
+            copy_stream.wait_event(events[prev_buffer_idx])
 
             yield self._get_results(numba_copy_stream, copy_stream)
 
@@ -1151,7 +1198,10 @@ class Sift:
             )
             copy_stream.record(events[current_buffer_idx])
             self.exec_stream.wait_event(events[current_buffer_idx])
-            runtime.cudaGraphLaunch(self.exec_graph, self.exec_stream.ptr)
+            if self.use_graph:
+                runtime.cudaGraphLaunch(self.exec_graph, self.exec_stream.ptr)
+            else:
+                compute(self.sift_data, self.params, self.numba_exec_stream)
             self.exec_stream.record(events[current_buffer_idx])
 
         # Final image
@@ -1177,7 +1227,7 @@ if __name__ == "__main__":
     # --- 1. Initial Setup ---
     first_img_for_setup = read_img(image_paths[0])
     params = SiftParams(img_dims=first_img_for_setup.shape)
-    sift = Sift(params)
+    sift = Sift(params, use_graph=True)  # Re-enable CUDA graphs
 
     for i, keypoints in enumerate(sift.process_images(image_paths)):
         print(f"{image_paths[i]}: {len(keypoints.positions)} keypoints")
