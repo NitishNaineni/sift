@@ -29,6 +29,7 @@ NHIST, NORIBIN = 4, 8
 NHIST2 = NHIST * NHIST
 DESC_LEN = NHIST2 * NORIBIN
 LAMBDA_DESC = numba.float32(6.0)
+ORI_THRESHOLD = numba.float32(0.8)
 
 
 @cuda.jit(device=True, inline=True, cache=True)
@@ -245,8 +246,6 @@ def invert_3x3(H, Hi):
         - H[0, 1] * (H[1, 0] * H[2, 2] - H[1, 2] * H[2, 0])
         + H[0, 2] * (H[1, 0] * H[2, 1] - H[1, 1] * H[2, 0])
     )
-    if ld.fabsf(det) < 1e-12:
-        return False
     k = 1.0 / det
     Hi[0, 0] = (H[1, 1] * H[2, 2] - H[2, 1] * H[1, 2]) * k
     Hi[0, 1] = (H[0, 2] * H[2, 1] - H[0, 1] * H[2, 2]) * k
@@ -267,7 +266,7 @@ def mat_vec_mul_3x1(M, v, out):
     out[2] = M[2, 0] * v[0] + M[2, 1] * v[1] + M[2, 2] * v[2]
 
 
-@cuda.jit(cache=True, fastmath=True)
+@cuda.jit(cache=True)
 def gradient_kernel(img, mag, ang):
     x, y = cuda.grid(2)
     h, w = img.shape
@@ -360,7 +359,15 @@ def downsample_kernel(src, dst):
 
 @cuda.jit(cache=True)
 def find_and_record_extrema_kernel(
-    dog_oct, o, int_buf, float_buf, counter, max_extrema, sigma_min, n_spo, delta_min
+    dog_oct,
+    o,
+    int_buf,
+    float_buf,
+    counter,
+    max_extrema,
+    sigma_min,
+    n_spo,
+    delta_min,
 ):
     s, y, x = cuda.grid(3)
     ns, h, w = dog_oct.shape
@@ -375,12 +382,13 @@ def find_and_record_extrema_kernel(
                 if ds == 0 and dy == 0 and dx == 0:
                     continue
                 n = dog_oct[s + ds, y + dy, x + dx]
-                if n > v:
+                if n >= v:
                     is_max = False
-                if n < v:
+                if n <= v:
                     is_min = False
                 if not is_max and not is_min:
                     return
+
     idx = cuda.atomic.add(counter, 0, 1)
     if idx >= max_extrema:
         cuda.atomic.add(counter, 1, 1)
@@ -441,8 +449,7 @@ def refine_filter_kernel(
             - dog_oct[s, y - 1, x + 1]
             + dog_oct[s, y - 1, x - 1]
         )
-        if not invert_3x3(Hm, Hin):
-            break
+        invert_3x3(Hm, Hin)
         mat_vec_mul_3x1(Hin, g, off)
         off[0], off[1], off[2] = -off[0], -off[1], -off[2]
         if ld.fabsf(off[0]) < 0.6 and ld.fabsf(off[1]) < 0.6 and ld.fabsf(off[2]) < 0.6:
@@ -478,7 +485,7 @@ def refine_filter_kernel(
     float_buf[idx, 3] = D_hat
 
 
-@cuda.jit(cache=True, fastmath=True)
+@cuda.jit(cache=True)
 def orientation_kernel_blockperkp(
     grad_mag,
     grad_ang,
@@ -549,18 +556,14 @@ def orientation_kernel_blockperkp(
             vmax = vmax if vmax > hist[i] else hist[i]
         if vmax == 0.0:
             return
-        thr = 0.8 * vmax
-        eps = 1e-9 * vmax
+        thr = ORI_THRESHOLD * vmax
         for i in range(ORI_BINS):
             p, c, n = hist[(i - 1) % ORI_BINS], hist[i], hist[(i + 1) % ORI_BINS]
             if c < thr or c <= p or c <= n:
                 continue
             denom = p - 2.0 * c + n
-            if ld.fabsf(denom) < eps:
-                continue
             off = (p - n) / (2.0 * denom)
-            off = 0.0 if ld.fabsf(off) > 1.0 else off
-            theta = wrap_angle((i + off) * (TWO_PI / ORI_BINS))
+            theta = wrap_angle((i + off + 0.5) * (TWO_PI / ORI_BINS))
             out = cuda.atomic.add(kp_counter, 0, 1)
             if out >= key_pos.shape[0]:
                 cuda.atomic.add(kp_counter, 0, -1)
@@ -574,7 +577,7 @@ def orientation_kernel_blockperkp(
             key_osl[out, 1] = s
 
 
-@cuda.jit(cache=True, fastmath=True)
+@cuda.jit(cache=True)
 def descriptor_kernel_blockperkp(
     grad_mag, grad_ang, kpos, kscale, kori, osl, kctr, desc, oct_idx, delta_min
 ):
@@ -610,9 +613,10 @@ def descriptor_kernel_blockperkp(
             dx0 = xx - x0
             dx = dx0 * c + dy0 * snt
             dy = -dx0 * snt + dy0 * c
-            u = dx / (radius * 2) * NHIST + (NHIST * 0.5 - 0.5)
-            v = dy / (radius * 2) * NHIST + (NHIST * 0.5 - 0.5)
-            if u < -1 or u > NHIST or v < -1 or v > NHIST:
+            u = dx / (2.0 * radiusF) * NHIST + (NHIST * 0.5 - 0.5)
+            v = dy / (2.0 * radiusF) * NHIST + (NHIST * 0.5 - 0.5)
+            R = (1.0 + 1.0 / NHIST) * radiusF
+            if ld.fabsf(dx) >= R or ld.fabsf(dy) >= R:
                 continue
             m = grad_mag[s, yy, xx]
             if m == 0.0:
@@ -635,7 +639,7 @@ def descriptor_kernel_blockperkp(
                         if 0 <= vv < NHIST:
                             wv = (1 - dv) if iv == 0 else dv
                             for io in (0, 1):
-                                oo = (o0 + io) & (NORIBIN - 1)
+                                oo = (o0 + io) % NORIBIN
                                 wo = (1 - do) if io == 0 else do
                                 hidx = ((vv * NHIST + uu) * NORIBIN) + oo
                                 cuda.atomic.add(hist, hidx, wbase * wu * wv * wo)
@@ -644,16 +648,20 @@ def descriptor_kernel_blockperkp(
         l2 = numba.float32(0.0)
         for i in range(DESC_LEN):
             l2 += hist[i] * hist[i]
-        l2 = ld.rsqrtf(l2 + 1e-7)
+        norm = ld.sqrtf(l2) + 1e-12
+        inv = 1.0 / norm
+
         l2p = numba.float32(0.0)
         for i in range(DESC_LEN):
-            v = hist[i] * l2
+            v = hist[i] * inv
             v = 0.2 if v > 0.2 else v
             hist[i] = v
             l2p += v * v
-        l2p = ld.rsqrtf(l2p + 1e-7)
+        norm2 = ld.sqrtf(l2p) + 1e-12
+        inv2 = 1.0 / norm2
+
         for i in range(DESC_LEN):
-            q = hist[i] * l2p * 512.0
+            q = hist[i] * inv2 * 512.0
             desc[kp_idx, i] = numba.uint8(255 if q > 255 else int(q + 0.5))
 
 
