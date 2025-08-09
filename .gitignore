@@ -1,3 +1,15 @@
+# Test artifacts
+tests/artifacts/
+
+# Local dumps (legacy)
+gss_c_output/
+ext_c_output/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
 data/
 *.o
 bin/

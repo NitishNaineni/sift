@@ -68,5 +68,6 @@ void print_sift_scalespace_gray(const struct sift_scalespace* scalespace, const 
 void print_sift_scalespace_gray_nearestneighbor(const struct sift_scalespace* scalespace, const char* basename);
 void print_sift_scalespace_rgb(const struct sift_scalespace* scalespace, const char* basename);
 void print_sift_scalespace_rgb_nointerp(const struct sift_scalespace* scalespace, const char* basename);
+void dump_scalespace_raw_to_dir(const struct sift_scalespace* scalespace, const char* out_dir, const char* stem);
 
 #endif
