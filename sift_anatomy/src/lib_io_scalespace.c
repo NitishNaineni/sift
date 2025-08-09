@@ -83,7 +83,96 @@ This file also implements the colomap published in the paper
 #include "lib_util.h"
 #include "io_png.h"
 
+/* --- raw float32 + JSON dumper for a scalespace --- */
+#include <string.h>
+#include <errno.h>
+#include <sys/types.h>
+#ifdef _WIN32
+  #include <direct.h>
+  #define MKDIR(d) _mkdir(d)
+  #define PATH_SEP '\\'
+#else
+  #include <sys/stat.h>
+  #define MKDIR(d) mkdir(d, 0755)
+  #define PATH_SEP '/'
+#endif
 
+static int mkdir_p(const char *path) {
+    if (!path || !*path) return 0;
+    char *tmp = strdup(path);
+    if (!tmp) return -1;
+    size_t len = strlen(tmp);
+    if (len && (tmp[len-1] == '/' || tmp[len-1] == '\\')) tmp[len-1] = '\0';
+
+    for (char *p = tmp + 1; *p; ++p) {
+        if (*p == '/' || *p == '\\') {
+            char c = *p; *p = '\0';
+            if (MKDIR(tmp) != 0 && errno != EEXIST) { free(tmp); return -1; }
+            *p = c;
+        }
+    }
+    if (MKDIR(tmp) != 0 && errno != EEXIST) { free(tmp); return -1; }
+    free(tmp);
+    return 0;
+}
+
+static void join3(char *out, size_t n, const char *a, const char *b, const char *c) {
+    /* out = a + PATH_SEP + b + c  (if a empty, just b+c) */
+    if (a && *a) {
+        snprintf(out, n, "%s%c%s%s", a, PATH_SEP, b, c);
+    } else {
+        snprintf(out, n, "%s%s", b, c);
+    }
+}
+
+static int write_f32_raw(const char *fname, const float *data, size_t n)
+{
+    FILE *f = fopen(fname, "wb");
+    if (!f) return -1;
+    size_t wrote = fwrite(data, sizeof(float), n, f);
+    fclose(f);
+    return wrote == n ? 0 : -2;
+}
+
+/* NEW: directory-aware dumper */
+void dump_scalespace_raw_to_dir(const struct sift_scalespace *ss,
+                                const char *out_dir, const char *stem)
+{
+    char path[FILENAME_MAX];
+    char jsonname[FILENAME_MAX];
+    FILE *jf = NULL;
+
+    mkdir_p(out_dir);
+
+    /* meta json lives in out_dir */
+    join3(jsonname, sizeof(jsonname), out_dir, stem, "_meta.json");
+    jf = fopen(jsonname, "w");
+    if (!jf) return;
+
+    fprintf(jf, "{\n  \"n_octaves\": %d,\n  \"stem\": \"%s\",\n  \"dir\": \"%s\",\n  \"octaves\": [\n",
+            ss->nOct, stem, out_dir ? out_dir : "");
+
+    for (int o = 0; o < ss->nOct; ++o) {
+        const struct octa *octave = ss->octaves[o];
+        int w = octave->w, h = octave->h, nSca = octave->nSca;
+
+        fprintf(jf, "    {\"o\": %d, \"w\": %d, \"h\": %d, \"delta\": %.9g, \"sigmas\": [",
+                o, w, h, octave->delta);
+        for (int s = 0; s < nSca; ++s) fprintf(jf, "%s%.9g", s ? ", " : "", octave->sigmas[s]);
+        fprintf(jf, "], \"files\": [");
+
+        for (int s = 0; s < nSca; ++s) {
+            char fname[FILENAME_MAX];
+            snprintf(fname, sizeof(fname), "%s_o%03d_s%03d.f32", stem, o, s);
+            join3(path, sizeof(path), out_dir, fname, "");
+            write_f32_raw(path, &octave->imStack[(size_t)s * w * h], (size_t)w * h);
+            fprintf(jf, "%s\"%s\"", s ? ", " : "", fname); /* store RELATIVE filenames */
+        }
+        fprintf(jf, "] }%s\n", (o == ss->nOct - 1) ? "" : ",");
+    }
+    fprintf(jf, "  ]\n}\n");
+    fclose(jf);
+}
 
 
 
