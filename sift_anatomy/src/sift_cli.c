@@ -81,6 +81,7 @@ void dump_scalespace_raw_to_dir(const struct sift_scalespace *ss,
 static void ensure_dir_exists(const char* dir);
 static void dump_raw_extrema_to_dir(const struct sift_keypoints* keys, const char* out_dir);
 static void dump_refined_extrema_to_dir(const struct sift_keypoints* keys, const char* out_dir);
+static void dump_oriented_keypoints_to_dir(const struct sift_keypoints* keys, const char* out_dir);
 
 #include <string.h>
 
@@ -339,6 +340,10 @@ int main(int argc, char **argv)
         nw = snprintf(path, sizeof(path), "%s/%s", dump_all_dir, "border");
         if (nw < 0 || (size_t)nw >= sizeof(path)) fatal_error("Path too long for border");
         dump_raw_extrema_to_dir(kk[5], path);
+        /* oriented keypoints (k) */
+        nw = snprintf(path, sizeof(path), "%s/%s", dump_all_dir, "keys");
+        if (nw < 0 || (size_t)nw >= sizeof(path)) fatal_error("Path too long for keys");
+        dump_oriented_keypoints_to_dir(k, path);
     }
 
     
@@ -477,6 +482,58 @@ static void dump_refined_extrema_to_dir(const struct sift_keypoints* keys, const
     fprintf(fm, "  \"float_file\": \"extrema_refined_float.f32\",\n");
     fprintf(fm, "  \"int_order\": [\"o\", \"s\", \"i\", \"j\"],\n");
     fprintf(fm, "  \"float_order\": [\"y\", \"x\", \"sigma\", \"val\"]\n");
+    fprintf(fm, "}\n");
+    fclose(fm);
+
+    xfree(buf_i);
+    xfree(buf_f);
+}
+
+static void dump_oriented_keypoints_to_dir(const struct sift_keypoints* keys, const char* out_dir)
+{
+    ensure_dir_exists(out_dir);
+
+    char path_int[FILENAME_MAX];
+    char path_float[FILENAME_MAX];
+    char path_meta[FILENAME_MAX];
+    snprintf(path_int, sizeof(path_int), "%s/%s", out_dir, "keys_int.i32");
+    snprintf(path_float, sizeof(path_float), "%s/%s", out_dir, "keys_float.f32");
+    snprintf(path_meta, sizeof(path_meta), "%s/%s", out_dir, "keys_meta.json");
+
+    int n = keys->size;
+    int (*buf_i)[4] = (int (*)[4])xmalloc((size_t)n * 4 * sizeof(int));
+    float (*buf_f)[4] = (float (*)[4])xmalloc((size_t)n * 4 * sizeof(float));
+
+    for (int k = 0; k < n; k++) {
+        const struct keypoint* key = keys->list[k];
+        buf_i[k][0] = key->o;
+        buf_i[k][1] = key->s;
+        buf_i[k][2] = key->i;
+        buf_i[k][3] = key->j;
+        buf_f[k][0] = key->x;     /* y_world */
+        buf_f[k][1] = key->y;     /* x_world */
+        buf_f[k][2] = key->sigma; /* sigma */
+        buf_f[k][3] = key->theta; /* orientation */
+    }
+
+    FILE* fi = fopen(path_int, "wb");
+    if (!fi) fatal_error("Failed to open %s for writing", path_int);
+    fwrite(buf_i, sizeof(int), (size_t)n * 4, fi);
+    fclose(fi);
+
+    FILE* ff = fopen(path_float, "wb");
+    if (!ff) fatal_error("Failed to open %s for writing", path_float);
+    fwrite(buf_f, sizeof(float), (size_t)n * 4, ff);
+    fclose(ff);
+
+    FILE* fm = fopen(path_meta, "w");
+    if (!fm) fatal_error("Failed to open %s for writing", path_meta);
+    fprintf(fm, "{\n");
+    fprintf(fm, "  \"count\": %d,\n", n);
+    fprintf(fm, "  \"int_file\": \"keys_int.i32\",\n");
+    fprintf(fm, "  \"float_file\": \"keys_float.f32\",\n");
+    fprintf(fm, "  \"int_order\": [\"o\", \"s\", \"i\", \"j\"],\n");
+    fprintf(fm, "  \"float_order\": [\"y\", \"x\", \"sigma\", \"theta\"]\n");
     fprintf(fm, "}\n");
     fclose(fm);
 
