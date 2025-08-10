@@ -35,46 +35,33 @@ class TestSiftCompute(unittest.TestCase):
         cls.data.input_img[...] = cp.asarray(img, dtype=cp.float32)
         cls.snapshots = compute(cls.data, cls.params, record=True)
 
-        # Build and run C CLI to record reference dumps (gss, dog, grad_x, grad_y)
+        # Always build and run C CLI to record fresh reference dumps
         cls.record_dir = cls.root / "tests/artifacts/record_c_output"
-        gss_meta = cls.record_dir / "gss/gss_meta.json"
-        dog_meta = cls.record_dir / "dog/dog_meta.json"
-        gradx_meta = cls.record_dir / "grad_x/grad_x_meta.json"
-        grady_meta = cls.record_dir / "grad_y/grad_y_meta.json"
-        if not (
-            gss_meta.exists()
-            and dog_meta.exists()
-            and gradx_meta.exists()
-            and grady_meta.exists()
-        ):
-            cli_bin = cls.root / "sift_anatomy/bin/sift_cli"
-            if not cli_bin.exists():
-                import subprocess
+        cli_bin = cls.root / "sift_anatomy/bin/sift_cli"
+        import subprocess
 
-                try:
-                    subprocess.run(
-                        ["make", "-C", str(cls.root / "sift_anatomy")],
-                        check=True,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                        text=True,
-                    )
-                except Exception as e:
-                    raise unittest.SkipTest(f"Failed to build sift_cli: {e}")
-            cls.record_dir.mkdir(parents=True, exist_ok=True)
-            import subprocess
-
-            try:
-                subprocess.run(
-                    [str(cli_bin), str(cls.img_path), "--record", str(cls.record_dir)],
-                    check=True,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    env=os.environ,
-                )
-            except Exception as e:
-                raise unittest.SkipTest(f"Failed to run sift_cli: {e}")
+        try:
+            subprocess.run(
+                ["make", "-C", str(cls.root / "sift_anatomy")],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        except Exception as e:
+            raise unittest.SkipTest(f"Failed to build sift_cli: {e}")
+        cls.record_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            subprocess.run(
+                [str(cli_bin), str(cls.img_path), "--record", str(cls.record_dir)],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=os.environ,
+            )
+        except Exception as e:
+            raise unittest.SkipTest(f"Failed to run sift_cli: {e}")
 
     def test_gss_dog_internal_consistency(self):
         tol = 1e-6
@@ -154,6 +141,121 @@ class TestSiftCompute(unittest.TestCase):
                 self.assertEqual(gy_cli.shape, pgx.shape)
                 self.assertLessEqual(np.max(np.abs(gx_cli - pgy)), tol)
                 self.assertLessEqual(np.max(np.abs(gy_cli - pgx)), tol)
+
+    def test_oriented_keypoints_match_cli_dump(self):
+        # Load C dump (oriented keypoints)
+        keys_dir = self.record_dir / "keys"
+        meta_path = keys_dir / "keys_meta.json"
+        if not meta_path.exists():
+            self.skipTest("keys dump not found (CLI didn't dump keys)")
+        with open(meta_path) as f:
+            meta = json.load(f)
+        ints_c = np.fromfile(
+            keys_dir / meta.get("int_file", "keys_int.i32"), dtype=np.int32
+        ).reshape(-1, 4)
+        flts_c = np.fromfile(
+            keys_dir / meta.get("float_file", "keys_float.f32"), dtype=np.float32
+        ).reshape(-1, 4)
+
+        # Collect python keys from snapshots (assign_orientations returns per-octave keys when record=True)
+        ints_list = []
+        flts_list = []
+        for o in range(self.params.n_oct):
+            pair = self.snapshots[o].get("keys")
+            if pair is None:
+                continue
+            ib, fb = pair
+            if ib.size > 0:
+                ints_list.append(ib)
+                flts_list.append(fb)
+        if ints_list:
+            import numpy as _np
+
+            ints_p = _np.concatenate(ints_list, axis=0)
+            flts_p = _np.concatenate(flts_list, axis=0)
+        else:
+            import numpy as _np
+
+            ints_p = _np.empty((0, 4), _np.int32)
+            flts_p = _np.empty((0, 4), _np.float32)
+
+        # Identity parity using (o, s, i, j) only
+        oc = ints_c[:, 0].astype(np.int32)
+        sc = ints_c[:, 1].astype(np.int32)
+        yi_c = ints_c[:, 2].astype(np.int32)
+        xi_c = ints_c[:, 3].astype(np.int32)
+
+        keys_c = [
+            (int(o), int(s), int(yi), int(xi))
+            for o, s, yi, xi in zip(oc, sc, yi_c, xi_c)
+        ]
+        keys_p = [(int(o), int(s), int(yi), int(xi)) for (o, s, yi, xi) in ints_p]
+
+        # Assert identity parity only (o, s, i, j)
+        set_c = set(keys_c)
+        set_p = set(keys_p)
+        only_c = set_c - set_p
+        only_p = set_p - set_c
+        if len(only_c) > 10 or len(only_p) > 10:
+            self.fail(
+                "pre-orientation identity mismatch: "
+                f"only_in_c={len(only_c)}, only_in_p={len(only_p)}"
+            )
+        # Orientation comparison for common identities
+        common_ids = set_c & set_p
+        from collections import defaultdict
+
+        grp_c: dict[tuple, list[float]] = defaultdict(list)
+        grp_p: dict[tuple, list[float]] = defaultdict(list)
+        for k, row in zip(keys_c, flts_c):
+            grp_c[k].append(float(row[3]))
+        for k, row in zip(keys_p, flts_p):
+            grp_p[k].append(float(row[3]))
+
+        def wrap_2pi(a: np.ndarray) -> np.ndarray:
+            twopi = np.float32(2.0 * np.pi)
+            return (a % twopi + twopi) % twopi
+
+        def circ_diff(a: float, b: float) -> float:
+            twopi = 2.0 * np.pi
+            da = abs(((a - b) + np.pi) % twopi - np.pi)
+            return float(da)
+
+        th_tol = 5e-2
+        worst = 0.0
+        bad = 0
+        count_mismatch = 0
+        for k in common_ids:
+            arr_c = np.array(grp_c.get(k, []), dtype=np.float32)
+            arr_p = np.array(grp_p.get(k, []), dtype=np.float32)
+            if arr_c.size != arr_p.size:
+                count_mismatch += 1
+                continue
+            if arr_c.size == 0:
+                continue
+            arr_c = wrap_2pi(arr_c)
+            arr_p = wrap_2pi(arr_p)
+            used = np.zeros(arr_p.size, dtype=bool)
+            for ang_c in arr_c:
+                diffs = np.array(
+                    [circ_diff(float(ang_c), float(ang_p)) for ang_p in arr_p]
+                )
+                diffs[used] = 1e9
+                j = int(np.argmin(diffs))
+                used[j] = True
+                d = float(diffs[j])
+                worst = max(worst, d)
+                if d > th_tol:
+                    bad += 1
+        self.assertEqual(
+            count_mismatch,
+            0,
+            msg=f"orientation count mismatch groups: {count_mismatch}",
+        )
+        self.assertEqual(
+            bad, 0, msg=f"orientation mismatches > tol: {bad}, worst={worst}"
+        )
+        return
 
     def test_extrema_matches_cli_dump(self):
         # Load C dump (raw extrema kA)

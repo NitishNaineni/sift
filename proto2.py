@@ -20,6 +20,12 @@ warnings.filterwarnings("ignore", category=NumbaPerformanceWarning)
 
 TX, TY = 16, 16
 TWO_PI = np.float32(6.28318530718)
+ORI_BINS = 36
+NHIST, NORIBIN = 4, 8
+NHIST2 = NHIST * NHIST
+DESC_LEN = NHIST2 * NORIBIN
+LAMBDA_DESC = numba.float32(6.0)
+ORI_THRESHOLD = numba.float32(0.8)
 W709_BGR = np.array(
     [0.072192315360734, 0.715168678767756, 0.212639005871510], dtype=np.float32
 )
@@ -40,9 +46,12 @@ class SiftParams:
     sigma_min: float = 0.8
 
     max_extrema: int = 10_000
+    max_keypoints: int = 10_000
 
     C_dog: float = 0.013333333
     C_edge: float = 10.0
+
+    lambda_ori: float = 1.5
 
     sigmas: np.ndarray | None = None
     gss_shapes: np.ndarray | None = None
@@ -110,11 +119,20 @@ class SiftParams:
 
 @dataclass
 class Extrema:
-    int_buffer: cp.ndarray
-    float_buffer: cp.ndarray
-    counter: cp.ndarray = field(
-        default_factory=lambda: cuda.device_array(2, dtype=np.int32)
+    int_buffer: cp.ndarray  # o, s, y_int, x_int
+    float_buffer: cp.ndarray  # y_world, x_world, sigma, dog_val
+    counter: cp.ndarray = field(  # extrema count, overflow count
+        default_factory=lambda: cp.zeros(2, dtype=np.int32)
     )
+
+
+@dataclass
+class Keypoints:
+    int_buffer: cp.ndarray  # o, s, y_int, x_int (match Extrema layout)
+    float_buffer: cp.ndarray  # y_world, x_world, sigma, orientation
+    descriptors: cp.ndarray  # 128-dim SIFT descriptor per keypoint (uint8)
+    # keypoint count, overflow count
+    counter: cp.ndarray = field(default_factory=lambda: cp.zeros(2, dtype=np.int32))
 
 
 @dataclass
@@ -127,6 +145,7 @@ class SiftData:
     grad_x: list[cp.ndarray]
     grad_y: list[cp.ndarray]
     extrema: Extrema
+    keypoints: Keypoints
 
 
 def _alloc_octave_tensors(params: SiftParams, octave_index: int):
@@ -151,6 +170,15 @@ def create_extrema(params: SiftParams) -> Extrema:
     )
 
 
+def create_keypoints(p: SiftParams) -> Keypoints:
+    n = p.max_keypoints
+    return Keypoints(
+        int_buffer=cp.empty((n, 4), np.int32),
+        float_buffer=cp.empty((n, 4), np.float32),
+        descriptors=cp.empty((n, 128), np.uint8),
+    )
+
+
 def create_sift_data(params: SiftParams) -> SiftData:
     gss, dog, scratch, grad_x, grad_y = zip(
         *(
@@ -168,6 +196,7 @@ def create_sift_data(params: SiftParams) -> SiftData:
         grad_x=tuple(grad_x),
         grad_y=tuple(grad_y),
         extrema=create_extrema(params),
+        keypoints=create_keypoints(params),
     )
 
 
@@ -579,7 +608,6 @@ def compute_gss(
     grad_y = data.grad_y[octave_index]
     scratch = data.scratch[octave_index]
     num_scales_total = params.n_spo + 3
-    # Compute derivatives with consistent naming: grad_x = dI/dx (columns), grad_y = dI/dy (rows)
     gradient(gss[0], grad_x[0], grad_y[0])
     for scale_index in range(1, num_scales_total):
         gaussian_blur(
@@ -815,6 +843,109 @@ def gradient_kernel(img, mag, ang):
     ang[y, x] = gy
 
 
+@cuda.jit(cache=True)
+def orientation_kernel(
+    grad_x,
+    grad_y,
+    int_buf,
+    float_buf,
+    n_extrema,
+    key_float,
+    key_int,
+    kp_counter,
+    oct_idx,
+    lambda_ori,
+    delta_min,
+):
+    kp_idx = cuda.blockIdx.x
+    if kp_idx >= n_extrema[0] or int_buf[kp_idx, 0] != oct_idx:
+        return
+    s = int_buf[kp_idx, 1]
+    # Use refined subpixel/world coordinates converted to octave coords
+    scale = delta_min * (1 << oct_idx)
+    y0 = float_buf[kp_idx, 0] / scale
+    x0 = float_buf[kp_idx, 1] / scale
+    sigma_w = float_buf[kp_idx, 2]
+    sigma_oct = sigma_w / scale
+    R = 3.0 * lambda_ori * sigma_oct
+    radius = int(R + 0.5)
+    radius = 1 if radius == 0 else radius
+    h, w = grad_x.shape[1:]
+    g_sigma = lambda_ori * sigma_oct
+    inv_2sig2 = 1.0 / (2.0 * g_sigma * g_sigma)
+    bin_scale = numba.float32(ORI_BINS / TWO_PI)
+    hist = cuda.shared.array(ORI_BINS, numba.float32)
+    tflat = cuda.threadIdx.y * TX + cuda.threadIdx.x
+    if tflat < ORI_BINS:
+        hist[tflat] = 0.0
+    cuda.syncthreads()
+    # Clamp patch to image bounds as C does (siMin..siMax, sjMin..sjMax)
+    siMin = 0 if (y0 - R + 0.5) < 0.0 else int(y0 - R + 0.5)
+    sjMin = 0 if (x0 - R + 0.5) < 0.0 else int(x0 - R + 0.5)
+    siMax_f = y0 + R + 0.5
+    sjMax_f = x0 + R + 0.5
+    siMax = h - 1 if siMax_f > (h - 1) else int(siMax_f)
+    sjMax = w - 1 if sjMax_f > (w - 1) else int(sjMax_f)
+    height = siMax - siMin + 1
+    width = sjMax - sjMin + 1
+    for dy in range(cuda.threadIdx.y, height, TY):
+        yy = siMin + dy
+        dyf = numba.float32(yy) - numba.float32(y0)
+        for dx in range(cuda.threadIdx.x, width, TX):
+            xx = sjMin + dx
+            dxf = numba.float32(xx) - numba.float32(x0)
+            gx = grad_x[s, yy, xx]
+            gy = grad_y[s, yy, xx]
+            m = ld.sqrtf(gx * gx + gy * gy)
+            if m == 0.0:
+                continue
+
+            a = wrap_angle(ld.atan2f(gx, gy))
+            wgt = m * ld.expf(-(dxf * dxf + dyf * dyf) * inv_2sig2)
+            # Match C: single-bin accumulation with +0.5 rounding
+            bin_f = a * bin_scale + numba.float32(0.5)
+            bin_i = int(ld.floorf(bin_f)) % ORI_BINS
+            if bin_i < 0:
+                bin_i += ORI_BINS
+            cuda.atomic.add(hist, bin_i, wgt)
+    cuda.syncthreads()
+    if tflat == 0:
+        tmp = cuda.local.array(ORI_BINS, numba.float32)
+        for _ in range(6):
+            for i in range(ORI_BINS):
+                tmp[i] = hist[i]
+            for i in range(ORI_BINS):
+                hist[i] = (
+                    tmp[(i - 1) % ORI_BINS] + tmp[i] + tmp[(i + 1) % ORI_BINS]
+                ) / 3.0
+        vmax = numba.float32(0.0)
+        for i in range(ORI_BINS):
+            vmax = vmax if vmax > hist[i] else hist[i]
+        if vmax == 0.0:
+            return
+        thr = ORI_THRESHOLD * vmax
+        for i in range(ORI_BINS):
+            p, c, n = hist[(i - 1) % ORI_BINS], hist[i], hist[(i + 1) % ORI_BINS]
+            if c < thr or c <= p or c <= n:
+                continue
+            denom = p - 2.0 * c + n
+            off = (p - n) / (2.0 * denom)
+            theta = wrap_angle((i + off + 0.5) * (TWO_PI / ORI_BINS))
+            out = cuda.atomic.add(kp_counter, 0, 1)
+            if out >= key_float.shape[0]:
+                cuda.atomic.add(kp_counter, 0, -1)
+                cuda.atomic.add(kp_counter, 1, 1)
+                return
+            key_float[out, 0] = float_buf[kp_idx, 0]  # y_world
+            key_float[out, 1] = float_buf[kp_idx, 1]  # x_world
+            key_float[out, 2] = sigma_w  # sigma
+            key_float[out, 3] = theta  # orientation
+            key_int[out, 0] = oct_idx  # o
+            key_int[out, 1] = s  # s
+            key_int[out, 2] = int_buf[kp_idx, 2]  # y_int
+            key_int[out, 3] = int_buf[kp_idx, 3]  # x_int
+
+
 def discard_on_edge(
     data: SiftData, params: SiftParams, octave_index: int, record: bool = False
 ):
@@ -884,6 +1015,35 @@ def discard_near_the_border_kernel(
         int_buf[idx, 0] = -1
 
 
+def assign_orientations(
+    data: SiftData, params: SiftParams, octave_index: int, record: bool = False
+):
+    orientation_kernel[(params.max_extrema,), (TX, TY)](
+        data.grad_x[octave_index],
+        data.grad_y[octave_index],
+        data.extrema.int_buffer,
+        data.extrema.float_buffer,
+        data.extrema.counter,
+        data.keypoints.float_buffer,
+        data.keypoints.int_buffer,
+        data.keypoints.counter,
+        octave_index,
+        params.lambda_ori,
+        params.delta_min,
+    )
+    if record:
+        total = int(cp.asnumpy(data.keypoints.counter)[0])
+        if total > 0:
+            ib = data.keypoints.int_buffer[:total]
+            fb = data.keypoints.float_buffer[:total]
+            mask = ib[:, 0] == octave_index
+            ints = cp.asnumpy(ib[mask])
+            flts = cp.asnumpy(fb[mask])
+            if ints.shape[0] > 0:
+                return (ints, flts)
+        return None
+
+
 def compute_octave(
     data: SiftData, params: SiftParams, octave_index: int, *, record: bool = False
 ) -> Optional[Dict[str, object]]:
@@ -899,6 +1059,7 @@ def compute_octave(
     snapshot["contrast_post"] = discard_with_low_response(data, params, 1.0, record)
     snapshot["edge"] = discard_on_edge(data, params, octave_index, record)
     snapshot["border"] = discard_near_the_border(data, params, octave_index, record)
+    snapshot["keys"] = assign_orientations(data, params, octave_index, record)
 
     return snapshot
 
