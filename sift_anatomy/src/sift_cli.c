@@ -77,14 +77,17 @@ this program. If not, see
 /* forward declaration from lib_io_scalespace.c */
 void dump_scalespace_raw_to_dir(const struct sift_scalespace *ss,
                                 const char *out_dir, const char *stem);
+/* forward declarations */
+static void ensure_dir_exists(const char* dir);
+static void dump_raw_extrema_to_dir(const struct sift_keypoints* keys, const char* out_dir);
+static void dump_refined_extrema_to_dir(const struct sift_keypoints* keys, const char* out_dir);
 
 #include <string.h>
 
 
 
 
-/* forward declaration for extrema dumping */
-static void dump_raw_extrema_to_dir(const struct sift_keypoints* keys, const char* out_dir);
+/* forward declaration for extrema dumping moved above */
 
 void print_usage()
 {
@@ -110,10 +113,9 @@ void print_usage()
     fprintf(stderr, "   -descr_nori    (8)   number of bins in each histogram                   \n");
     fprintf(stderr, "   -descr_lambda  (6)   sets how local the descriptor is                   \n");
     fprintf(stderr, "                                                                           \n");
-    fprintf(stderr, "   -verb_ss     label   flag to output the scalespaces (Gaussian and DoG)  \n");
-    fprintf(stderr, "   -dump_ss_dir dir    dump GSS to directory with default stem 'gss'     \n");
-    fprintf(stderr, "   -dump_dog_dir dir    dump DoG to directory with default stem 'dog'     \n");
-    fprintf(stderr, "   -dump_extrema_dir dir dump raw discrete extrema (kA) to directory      \n");
+    fprintf(stderr, "   --record dir        dump all outputs into a single directory with      \n");
+    fprintf(stderr, "                        subfolders: gss, dog, grad_x, grad_y, extrema,     \n");
+    fprintf(stderr, "                        contrast_pre, refined, contrast_post, edge, border\n");
 }
 
 
@@ -166,11 +168,7 @@ static int pick_option(int* c, char*** v, char* opt, char* val)
 
 static int parse_options(int argc, char** argv,
                          struct sift_parameters* p,
-                         int *flag_ss,
-                         char* label_ss,
-                         char* dump_ss_dir,
-                         char* dump_dog_dir,
-                         char* dump_extrema_dir)
+                         char* dump_all_dir)
 {
     int isfound;
     char val[128];
@@ -227,23 +225,8 @@ static int parse_options(int argc, char** argv,
     if (isfound ==  1)    p->lambda_descr = atof(val);
     if (isfound == -1)    return EXIT_FAILURE;
 
-    isfound = pick_option(&argc, &argv, "verb_ss", val);
-    if (isfound ==  1){
-        *flag_ss = 1;
-        strcpy(label_ss, val);
-    }
-    if (isfound == -1)    return EXIT_FAILURE;
-
-    isfound = pick_option(&argc, &argv, "dump_ss_dir", val);
-    if (isfound == 1) { strcpy(dump_ss_dir, val); }
-    if (isfound == -1) return EXIT_FAILURE;
-
-    isfound = pick_option(&argc, &argv, "dump_dog_dir", val);
-    if (isfound == 1) { strcpy(dump_dog_dir, val); }
-    if (isfound == -1) return EXIT_FAILURE;
-
-    isfound = pick_option(&argc, &argv, "dump_extrema_dir", val);
-    if (isfound == 1) { strcpy(dump_extrema_dir, val); }
+    isfound = pick_option(&argc, &argv, "-record", val);
+    if (isfound == 1) { strcpy(dump_all_dir, val); }
     if (isfound == -1) return EXIT_FAILURE;
 
     // check for unknown option call
@@ -280,16 +263,11 @@ int main(int argc, char **argv)
 {
     // Setting default parameters
     struct sift_parameters* p = sift_assign_default_parameters();
-    int flagverb_ss = 0;
-    char label_ss[256];
-    strcpy(label_ss, "extra");
+    
 
     // Parsing command line
-    char dump_ss_dir[FILENAME_MAX] = "";
-    char dump_dog_dir[FILENAME_MAX] = "";
-    char dump_extrema_dir[FILENAME_MAX] = "";
-    int res = parse_options(argc, argv, p, &flagverb_ss, label_ss,
-                           dump_ss_dir, dump_dog_dir, dump_extrema_dir);
+    char dump_all_dir[FILENAME_MAX] = "";
+    int res = parse_options(argc, argv, p, dump_all_dir);
     if (res == EXIT_FAILURE)
         return EXIT_FAILURE;
 
@@ -315,28 +293,55 @@ int main(int argc, char **argv)
     /** OUTPUT */
     /* Keypoint printing removed for GSS/DoG-only mode */
 
-    char name[FILENAME_MAX];
+    /* name variable removed */
     /* All keypoint save/debug outputs removed */
-    if (flagverb_ss == 1){
-        sprintf(name,"scalespace_%s",label_ss);     print_sift_scalespace_gray_nearestneighbor(ss[0],name);
-        sprintf(name,"DoG_%s",label_ss);            print_sift_scalespace_rgb(ss[1],name);
-    }
-    /* GSS */
-    if (dump_ss_dir[0]) {
-        dump_scalespace_raw_to_dir(ss[0], dump_ss_dir, "gss");
+    /* Single unified dump directory (only mode supported) */
+    if (dump_all_dir[0]) {
+        char path[FILENAME_MAX];
+        ensure_dir_exists(dump_all_dir);
+        /* gss */
+        int nw = snprintf(path, sizeof(path), "%s/%s", dump_all_dir, "gss");
+        if (nw < 0 || (size_t)nw >= sizeof(path)) fatal_error("Path too long for gss");
+        dump_scalespace_raw_to_dir(ss[0], path, "gss");
+        /* dog */
+        nw = snprintf(path, sizeof(path), "%s/%s", dump_all_dir, "dog");
+        if (nw < 0 || (size_t)nw >= sizeof(path)) fatal_error("Path too long for dog");
+        dump_scalespace_raw_to_dir(ss[1], path, "dog");
+        /* grad_x */
+        nw = snprintf(path, sizeof(path), "%s/%s", dump_all_dir, "grad_x");
+        if (nw < 0 || (size_t)nw >= sizeof(path)) fatal_error("Path too long for grad_x");
+        dump_scalespace_raw_to_dir(ss[2], path, "grad_x");
+        /* grad_y */
+        nw = snprintf(path, sizeof(path), "%s/%s", dump_all_dir, "grad_y");
+        if (nw < 0 || (size_t)nw >= sizeof(path)) fatal_error("Path too long for grad_y");
+        dump_scalespace_raw_to_dir(ss[3], path, "grad_y");
+        /* extrema (kA) */
+        nw = snprintf(path, sizeof(path), "%s/%s", dump_all_dir, "extrema");
+        if (nw < 0 || (size_t)nw >= sizeof(path)) fatal_error("Path too long for extrema");
+        dump_raw_extrema_to_dir(kk[0], path);
+        /* contrast_pre (kB) */
+        nw = snprintf(path, sizeof(path), "%s/%s", dump_all_dir, "contrast_pre");
+        if (nw < 0 || (size_t)nw >= sizeof(path)) fatal_error("Path too long for contrast_pre");
+        dump_raw_extrema_to_dir(kk[1], path);
+        /* refined (kC) */
+        nw = snprintf(path, sizeof(path), "%s/%s", dump_all_dir, "refined");
+        if (nw < 0 || (size_t)nw >= sizeof(path)) fatal_error("Path too long for refined");
+        dump_refined_extrema_to_dir(kk[2], path);
+        /* contrast_post (kD) */
+        nw = snprintf(path, sizeof(path), "%s/%s", dump_all_dir, "contrast_post");
+        if (nw < 0 || (size_t)nw >= sizeof(path)) fatal_error("Path too long for contrast_post");
+        dump_raw_extrema_to_dir(kk[3], path);
+        /* edge (kE) */
+        nw = snprintf(path, sizeof(path), "%s/%s", dump_all_dir, "edge");
+        if (nw < 0 || (size_t)nw >= sizeof(path)) fatal_error("Path too long for edge");
+        dump_raw_extrema_to_dir(kk[4], path);
+        /* border (kF) */
+        nw = snprintf(path, sizeof(path), "%s/%s", dump_all_dir, "border");
+        if (nw < 0 || (size_t)nw >= sizeof(path)) fatal_error("Path too long for border");
+        dump_raw_extrema_to_dir(kk[5], path);
     }
 
-    /* DoG */
-    if (dump_dog_dir[0]) {
-        dump_scalespace_raw_to_dir(ss[1], dump_dog_dir, "dog");
-    }
-
-    /* Raw discrete extrema (kA) */
-    if (dump_extrema_dir[0]) {
-        /* Write raw 3D discrete extrema before any refinement or filtering */
-        /* kk[0] contains the raw discrete extrema (kA) */
-        dump_raw_extrema_to_dir(kk[0], dump_extrema_dir);
-    }
+    
 
     /* memory deallocation */
     xfree(x);
@@ -418,6 +423,58 @@ static void dump_raw_extrema_to_dir(const struct sift_keypoints* keys, const cha
     fprintf(fm, "  \"count\": %d,\n", n);
     fprintf(fm, "  \"int_file\": \"extrema_int.i32\",\n");
     fprintf(fm, "  \"float_file\": \"extrema_float.f32\",\n");
+    fprintf(fm, "  \"int_order\": [\"o\", \"s\", \"i\", \"j\"],\n");
+    fprintf(fm, "  \"float_order\": [\"y\", \"x\", \"sigma\", \"val\"]\n");
+    fprintf(fm, "}\n");
+    fclose(fm);
+
+    xfree(buf_i);
+    xfree(buf_f);
+}
+
+static void dump_refined_extrema_to_dir(const struct sift_keypoints* keys, const char* out_dir)
+{
+    ensure_dir_exists(out_dir);
+
+    char path_int[FILENAME_MAX];
+    char path_float[FILENAME_MAX];
+    char path_meta[FILENAME_MAX];
+    snprintf(path_int, sizeof(path_int), "%s/%s", out_dir, "extrema_refined_int.i32");
+    snprintf(path_float, sizeof(path_float), "%s/%s", out_dir, "extrema_refined_float.f32");
+    snprintf(path_meta, sizeof(path_meta), "%s/%s", out_dir, "extrema_refined_meta.json");
+
+    int n = keys->size;
+    int (*buf_i)[4] = (int (*)[4])xmalloc((size_t)n * 4 * sizeof(int));
+    float (*buf_f)[4] = (float (*)[4])xmalloc((size_t)n * 4 * sizeof(float));
+
+    for (int k = 0; k < n; k++) {
+        const struct keypoint* key = keys->list[k];
+        buf_i[k][0] = key->o;
+        buf_i[k][1] = key->s;
+        buf_i[k][2] = key->i;
+        buf_i[k][3] = key->j;
+        buf_f[k][0] = key->x; /* y_world */
+        buf_f[k][1] = key->y; /* x_world */
+        buf_f[k][2] = key->sigma;
+        buf_f[k][3] = key->val; /* D_hat */
+    }
+
+    FILE* fi = fopen(path_int, "wb");
+    if (!fi) fatal_error("Failed to open %s for writing", path_int);
+    fwrite(buf_i, sizeof(int), (size_t)n * 4, fi);
+    fclose(fi);
+
+    FILE* ff = fopen(path_float, "wb");
+    if (!ff) fatal_error("Failed to open %s for writing", path_float);
+    fwrite(buf_f, sizeof(float), (size_t)n * 4, ff);
+    fclose(ff);
+
+    FILE* fm = fopen(path_meta, "w");
+    if (!fm) fatal_error("Failed to open %s for writing", path_meta);
+    fprintf(fm, "{\n");
+    fprintf(fm, "  \"count\": %d,\n", n);
+    fprintf(fm, "  \"int_file\": \"extrema_refined_int.i32\",\n");
+    fprintf(fm, "  \"float_file\": \"extrema_refined_float.f32\",\n");
     fprintf(fm, "  \"int_order\": [\"o\", \"s\", \"i\", \"j\"],\n");
     fprintf(fm, "  \"float_order\": [\"y\", \"x\", \"sigma\", \"val\"]\n");
     fprintf(fm, "}\n");

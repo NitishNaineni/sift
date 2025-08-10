@@ -1,6 +1,7 @@
 from __future__ import annotations
 from pathlib import Path
 from dataclasses import dataclass, field
+from typing import Dict, Optional
 import cupy as cp
 import numpy as np
 import cv2
@@ -19,15 +20,9 @@ warnings.filterwarnings("ignore", category=NumbaPerformanceWarning)
 
 TX, TY = 16, 16
 TWO_PI = np.float32(6.28318530718)
-ORI_BINS = 36
-NHIST, NORIBIN = 4, 8
-NHIST2 = NHIST * NHIST
-DESC_LEN = NHIST2 * NORIBIN
-LAMBDA_DESC = numba.float32(6.0)
-ORI_THRESHOLD = numba.float32(0.8)
 W709_BGR = np.array(
     [0.072192315360734, 0.715168678767756, 0.212639005871510], dtype=np.float32
-)  # Cb,Cg,Cr
+)
 
 
 def read_gray_bt709(path: str) -> np.ndarray:
@@ -49,13 +44,13 @@ class SiftParams:
     C_dog: float = 0.013333333
     C_edge: float = 10.0
 
-    # outputs
     sigmas: np.ndarray | None = None
     gss_shapes: np.ndarray | None = None
     inc_sigmas: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         self._update_octave_count()
+        self._scale_invariant_C_dog()
         self.sigmas = self._make_sigmas()
         self.gss_shapes = self._make_gss_shapes()
         self.inc_sigmas = self._make_sigma_increments()
@@ -63,6 +58,11 @@ class SiftParams:
     def _update_octave_count(self) -> None:
         max_n_oct = math.floor(math.log2(min(self.img_dims) / self.delta_min / 12)) + 1
         self.n_oct = max_n_oct if self.n_oct == -1 else min(max_n_oct, self.n_oct)
+
+    def _scale_invariant_C_dog(self) -> None:
+        kn = np.exp(np.log(2) / self.n_spo)
+        k3 = np.exp(np.log(2) / 3.0)
+        self.C_dog *= (kn - 1) / (k3 - 1)
 
     def _make_sigmas(self) -> np.ndarray:
         num_octaves = self.n_oct
@@ -73,7 +73,7 @@ class SiftParams:
         ]
         return (self.sigma_min * (2.0 ** (octave_indices + scale_offsets))).astype(
             np.float32
-        )  # (num_octaves, num_scales_total)
+        )
 
     def _make_gss_shapes(self) -> np.ndarray:
         base = np.array(
@@ -83,11 +83,11 @@ class SiftParams:
             ],
             dtype=np.int64,
         )
-        hw = base // (1 << np.arange(self.n_oct, dtype=np.int64))[:, None]  # (O,2)
+        hw = base // (1 << np.arange(self.n_oct, dtype=np.int64))[:, None]
         return hw
 
     def _make_sigma_increments(self) -> np.ndarray:
-        sig = self.sigmas.astype(np.float32)  # (num_octaves, num_scales_total)
+        sig = self.sigmas.astype(np.float32)
         num_octaves, num_scales_total = sig.shape
         inc = np.empty_like(sig, dtype=np.float32)
 
@@ -101,19 +101,11 @@ class SiftParams:
             :, None
         ]
 
-        # C does sqrt(max(sig^2 - prev^2, 0)) / delta  in float
         diff2 = sig * sig - prev * prev
         np.maximum(diff2, 0.0, out=diff2, dtype=np.float32)
-        np.sqrt(diff2, out=diff2)  # stays float32
+        np.sqrt(diff2, out=diff2)
         inc[:, :] = diff2 / deltas
         return inc
-
-    def converted_dog_thresholds(self) -> tuple[float, float]:
-        # Match C's convert_threshold: ((k_nspo-1)/(k_3-1)) * C_DoG
-        k_nspo = math.exp(math.log(2.0) / float(self.n_spo))
-        k_3 = math.exp(math.log(2.0) / 3.0)
-        thresh = ((k_nspo - 1.0) / (k_3 - 1.0)) * float(self.C_dog)
-        return 0.8 * thresh, thresh
 
 
 @dataclass
@@ -132,19 +124,24 @@ class SiftData:
     scratch: list[cp.ndarray]
     gss: list[cp.ndarray]
     dog: list[cp.ndarray]
+    grad_x: list[cp.ndarray]
+    grad_y: list[cp.ndarray]
     extrema: Extrema
 
 
-def _alloc_octave_tensors(params: SiftParams, o: int):
-    h, w = params.gss_shapes[o]
-    ng = params.n_spo + 3
-    nd = params.n_spo + 2
+def _alloc_octave_tensors(params: SiftParams, octave_index: int):
+    height, width = params.gss_shapes[octave_index]
+    num_gss_scales = params.n_spo + 3
+    num_dog_scales = params.n_spo + 2
 
-    gss = cp.empty((ng, h, w), np.float32)
-    dog = cp.empty((nd, h, w), np.float32)
-    scratch = cp.empty((h, w), np.float32)
+    gss = cp.empty((num_gss_scales, height, width), np.float32)
+    dog = cp.empty((num_dog_scales, height, width), np.float32)
+    scratch = cp.empty((height, width), np.float32)
+    # Use CuPy arrays so we can easily move to host with cp.asnumpy
+    grad_x = cp.empty((num_gss_scales, height, width), np.float32)
+    grad_y = cp.empty((num_gss_scales, height, width), np.float32)
 
-    return gss, dog, scratch
+    return gss, dog, scratch, grad_x, grad_y
 
 
 def create_extrema(params: SiftParams) -> Extrema:
@@ -155,8 +152,11 @@ def create_extrema(params: SiftParams) -> Extrema:
 
 
 def create_sift_data(params: SiftParams) -> SiftData:
-    gss, dog, scratch = zip(
-        *(_alloc_octave_tensors(params, o) for o in range(params.n_oct))
+    gss, dog, scratch, grad_x, grad_y = zip(
+        *(
+            _alloc_octave_tensors(params, octave_index)
+            for octave_index in range(params.n_oct)
+        )
     )
     h0, w0 = params.gss_shapes[0]
     return SiftData(
@@ -165,6 +165,8 @@ def create_sift_data(params: SiftParams) -> SiftData:
         scratch=tuple(scratch),
         gss=tuple(gss),
         dog=tuple(dog),
+        grad_x=tuple(grad_x),
+        grad_y=tuple(grad_y),
         extrema=create_extrema(params),
     )
 
@@ -179,17 +181,14 @@ def oversample_bilinear_kernel(src, dst, delta_min):
 
     hi, wi = src.shape
 
-    # C: x = i*delta; y = j*delta
     x = numba.float32(i_out) * delta_min
     y = numba.float32(j_out) * delta_min
 
-    # C: int cast (truncation)
     im = int(x)
     jm = int(y)
     ip = im + 1
     jp = jm + 1
 
-    # symmetrization (exact same mapping)
     if ip >= hi:
         ip = 2 * hi - 1 - ip
     if im >= hi:
@@ -199,7 +198,6 @@ def oversample_bilinear_kernel(src, dst, delta_min):
     if jm >= wi:
         jm = 2 * wi - 1 - jm
 
-    # fractional parts use floorf in C
     fx = numba.float32(x - ld.floorf(x))
     fy = numba.float32(y - ld.floorf(y))
     one = numba.float32(1.0)
@@ -216,8 +214,6 @@ def oversample_bilinear_kernel(src, dst, delta_min):
 
 @cuda.jit(device=True, inline=True, cache=True)
 def mirror(i: int, n: int) -> int:
-    # C's symmetrized_coordinates:
-    # ll = 2*n; i = (i+ll)%ll; if(i>n-1) i = ll-1-i;
     ll = n << 1
     i = (i + ll) % ll
     if i > n - 1:
@@ -227,10 +223,9 @@ def mirror(i: int, n: int) -> int:
 
 @cuda.jit(cache=True)
 def gauss_h(src, dst, g, radius):
-    # dynamic shared tile (float32)
     tile = cuda.shared.array(shape=0, dtype=numba.float32)
 
-    x, y = cuda.grid(2)  # x: column, y: row
+    x, y = cuda.grid(2)
     tx = cuda.threadIdx.x
     h, w_in = src.shape
     bs = cuda.blockDim.x
@@ -238,7 +233,6 @@ def gauss_h(src, dst, g, radius):
     tile_w = bs + 2 * radius
     base_x = cuda.blockIdx.x * bs - radius
 
-    # cooperative load with mirroring
     for i in range(tx, tile_w, bs):
         lx = base_x + i
         tile[i] = src[y, mirror(lx, w_in)]
@@ -246,9 +240,8 @@ def gauss_h(src, dst, g, radius):
 
     if x < w_in and y < h:
         center = tile[tx + radius]
-        acc = numba.float32(center * g[0])  # center term
+        acc = numba.float32(center * g[0])
 
-        # pair-sum in the SAME order as C code
         for k in range(1, radius + 1):
             left = tile[tx + radius - k]
             right = tile[tx + radius + k]
@@ -261,7 +254,7 @@ def gauss_h(src, dst, g, radius):
 def gauss_v(src, dst, g, radius):
     tile = cuda.shared.array(shape=0, dtype=numba.float32)
 
-    x, y = cuda.grid(2)  # x: column, y: row
+    x, y = cuda.grid(2)
     ty = cuda.threadIdx.y
     h_in, w_in = src.shape
     bs = cuda.blockDim.y
@@ -269,7 +262,6 @@ def gauss_v(src, dst, g, radius):
     tile_h = bs + 2 * radius
     base_y = cuda.blockIdx.y * bs - radius
 
-    # cooperative load with mirroring
     for i in range(ty, tile_h, bs):
         ly = base_y + i
         tile[i] = src[mirror(ly, h_in), x]
@@ -277,9 +269,8 @@ def gauss_v(src, dst, g, radius):
 
     if x < w_in and y < h_in:
         center = tile[ty + radius]
-        acc = numba.float32(center * g[0])  # center term
+        acc = numba.float32(center * g[0])
 
-        # pair-sum in the SAME order as C code
         for k in range(1, radius + 1):
             up = tile[ty + radius - k]
             down = tile[ty + radius + k]
@@ -317,6 +308,7 @@ def find_and_record_extrema_kernel(
     sigma_min,
     n_spo,
     delta_min,
+    dog_pre_thresh,
 ):
     s, y, x = cuda.grid(3)
     ns, h, w = dog_oct.shape
@@ -346,11 +338,186 @@ def find_and_record_extrema_kernel(
     int_buf[idx, 1] = s
     int_buf[idx, 2] = y
     int_buf[idx, 3] = x
-    scale = delta_min * (1 << o)
-    float_buf[idx, 0] = y * scale
-    float_buf[idx, 1] = x * scale
-    float_buf[idx, 2] = sigma_min * (2.0 ** (o + s / n_spo))
+    scale = numba.float32(delta_min) * numba.float32(1 << o)
+    float_buf[idx, 0] = numba.float32(y) * scale
+    float_buf[idx, 1] = numba.float32(x) * scale
+    exp_arg = numba.float32(o) + (numba.float32(s) / numba.float32(n_spo))
+    float_buf[idx, 2] = numba.float32(sigma_min) * ld.exp2f(exp_arg)
     float_buf[idx, 3] = v
+
+
+@cuda.jit(device=True, inline=True, cache=True)
+def invert_3x3(H, Hi):
+    det = (
+        H[0, 0] * (H[1, 1] * H[2, 2] - H[2, 1] * H[1, 2])
+        - H[0, 1] * (H[1, 0] * H[2, 2] - H[1, 2] * H[2, 0])
+        + H[0, 2] * (H[1, 0] * H[2, 1] - H[1, 1] * H[2, 0])
+    )
+    k = 1.0 / det
+    Hi[0, 0] = (H[1, 1] * H[2, 2] - H[2, 1] * H[1, 2]) * k
+    Hi[0, 1] = (H[0, 2] * H[2, 1] - H[0, 1] * H[2, 2]) * k
+    Hi[0, 2] = (H[0, 1] * H[1, 2] - H[0, 2] * H[1, 1]) * k
+    Hi[1, 0] = (H[1, 2] * H[2, 0] - H[1, 0] * H[2, 2]) * k
+    Hi[1, 1] = (H[0, 0] * H[2, 2] - H[0, 2] * H[2, 0]) * k
+    Hi[1, 2] = (H[1, 0] * H[0, 2] - H[0, 0] * H[1, 2]) * k
+    Hi[2, 0] = (H[1, 0] * H[2, 1] - H[2, 0] * H[1, 1]) * k
+    Hi[2, 1] = (H[2, 0] * H[0, 1] - H[0, 0] * H[2, 1]) * k
+    Hi[2, 2] = (H[0, 0] * H[1, 1] - H[1, 0] * H[0, 1]) * k
+    return True
+
+
+@cuda.jit(device=True, inline=True, cache=True)
+def mat_vec_mul_3x1(M, v, out):
+    out[0] = M[0, 0] * v[0] + M[0, 1] * v[1] + M[0, 2] * v[2]
+    out[1] = M[1, 0] * v[0] + M[1, 1] * v[1] + M[1, 2] * v[2]
+    out[2] = M[2, 0] * v[0] + M[2, 1] * v[1] + M[2, 2] * v[2]
+
+
+@cuda.jit(cache=True)
+def refine_kernel(dog_oct, int_buf, float_buf, ext_count, n_spo, sigma_min, delta_min):
+    idx = cuda.grid(1)
+    if idx >= ext_count[0]:
+        return
+    o = int_buf[idx, 0]
+    if o == -1:
+        return
+    s, y, x = int_buf[idx, 1], int_buf[idx, 2], int_buf[idx, 3]
+    ns, h, w = dog_oct.shape
+    g = cuda.local.array(3, dtype=numba.float32)
+    Hm = cuda.local.array((3, 3), dtype=numba.float32)
+    Hin = cuda.local.array((3, 3), dtype=numba.float32)
+    off = cuda.local.array(3, dtype=numba.float32)
+    valid = False
+    for _ in range(5):
+        in_bounds = 1 <= s < ns - 1 and 1 <= y < h - 1 and 1 <= x < w - 1
+        if in_bounds:
+            g[0] = 0.5 * (dog_oct[s + 1, y, x] - dog_oct[s - 1, y, x])
+            g[1] = 0.5 * (dog_oct[s, y + 1, x] - dog_oct[s, y - 1, x])
+            g[2] = 0.5 * (dog_oct[s, y, x + 1] - dog_oct[s, y, x - 1])
+            Hm[0, 0] = (
+                dog_oct[s + 1, y, x] + dog_oct[s - 1, y, x] - 2 * dog_oct[s, y, x]
+            )
+            Hm[1, 1] = (
+                dog_oct[s, y + 1, x] + dog_oct[s, y - 1, x] - 2 * dog_oct[s, y, x]
+            )
+            Hm[2, 2] = (
+                dog_oct[s, y, x + 1] + dog_oct[s, y, x - 1] - 2 * dog_oct[s, y, x]
+            )
+            Hm[0, 1] = Hm[1, 0] = 0.25 * (
+                dog_oct[s + 1, y + 1, x]
+                - dog_oct[s + 1, y - 1, x]
+                - dog_oct[s - 1, y + 1, x]
+                + dog_oct[s - 1, y - 1, x]
+            )
+            Hm[0, 2] = Hm[2, 0] = 0.25 * (
+                dog_oct[s + 1, y, x + 1]
+                - dog_oct[s + 1, y, x - 1]
+                - dog_oct[s - 1, y, x + 1]
+                + dog_oct[s - 1, y, x - 1]
+            )
+            Hm[1, 2] = Hm[2, 1] = 0.25 * (
+                dog_oct[s, y + 1, x + 1]
+                - dog_oct[s, y + 1, x - 1]
+                - dog_oct[s, y - 1, x + 1]
+                + dog_oct[s, y - 1, x - 1]
+            )
+            invert_3x3(Hm, Hin)
+            mat_vec_mul_3x1(Hin, g, off)
+            off[0], off[1], off[2] = -off[0], -off[1], -off[2]
+        else:
+            off[0] = numba.float32(5.0)
+            off[1] = numba.float32(5.0)
+            off[2] = numba.float32(5.0)
+        if (
+            ld.fabsf(off[0]) < numba.float32(0.6)
+            and ld.fabsf(off[1]) < numba.float32(0.6)
+            and ld.fabsf(off[2]) < numba.float32(0.6)
+        ):
+            valid = True
+            break
+
+        if off[1] > numba.float32(0.6) and (y + 1) < (h - 1):
+            y += 1
+        if off[1] < numba.float32(-0.6) and (y - 1) > 0:
+            y -= 1
+        if off[2] > numba.float32(0.6) and (x + 1) < (w - 1):
+            x += 1
+        if off[2] < numba.float32(-0.6) and (x - 1) > 0:
+            x -= 1
+        if off[0] > numba.float32(0.6) and (s + 1) < (ns - 1):
+            s += 1
+        if off[0] < numba.float32(-0.6) and (s - 1) > 0:
+            s -= 1
+
+    if not valid:
+        int_buf[idx, 0] = -1
+        return
+
+    if not (1 <= s < ns - 1 and 1 <= y < h - 1 and 1 <= x < w - 1):
+        int_buf[idx, 0] = -1
+        return
+    D_hat = numba.float32(dog_oct[s, y, x]) + numba.float32(0.5) * (
+        g[0] * off[0] + g[1] * off[1] + g[2] * off[2]
+    )
+    int_buf[idx, 1], int_buf[idx, 2], int_buf[idx, 3] = s, y, x
+    scale = numba.float32(delta_min) * numba.float32(1 << o)
+    float_buf[idx, 0] = (numba.float32(y) + off[1]) * scale
+    float_buf[idx, 1] = (numba.float32(x) + off[2]) * scale
+    exp_arg = numba.float32(o) + (numba.float32(s) + off[0]) / numba.float32(n_spo)
+    float_buf[idx, 2] = numba.float32(sigma_min) * ld.exp2f(exp_arg)
+    float_buf[idx, 3] = D_hat
+
+
+@cuda.jit(cache=True)
+def filter_kernel(dog_oct, int_buf, float_buf, ext_count, C_dog, C_edge):
+    idx = cuda.grid(1)
+    if idx >= ext_count[0]:
+        return
+    o = int_buf[idx, 0]
+    if o == -1:
+        return
+    s, y, x = int_buf[idx, 1], int_buf[idx, 2], int_buf[idx, 3]
+    ns, h, w = dog_oct.shape
+    if not (1 <= s < ns - 1 and 1 <= y < h - 1 and 1 <= x < w - 1):
+        int_buf[idx, 0] = -1
+        return
+
+    if ld.fabsf(float_buf[idx, 3]) < C_dog:
+        int_buf[idx, 0] = -1
+        return
+
+    Hxx = dog_oct[s, y + 1, x] + dog_oct[s, y - 1, x] - 2 * dog_oct[s, y, x]
+    Hyy = dog_oct[s, y, x + 1] + dog_oct[s, y, x - 1] - 2 * dog_oct[s, y, x]
+    Hxy = 0.25 * (
+        dog_oct[s, y + 1, x + 1]
+        - dog_oct[s, y + 1, x - 1]
+        - dog_oct[s, y - 1, x + 1]
+        + dog_oct[s, y - 1, x - 1]
+    )
+    det = Hxx * Hyy - Hxy * Hxy
+    if det <= 0:
+        int_buf[idx, 0] = -1
+        return
+    trace = Hxx + Hyy
+    r = C_edge
+    if (trace * trace) / det > ((r + 1) * (r + 1) / r):
+        int_buf[idx, 0] = -1
+        return
+
+
+@cuda.jit(cache=True)
+def discard_with_low_response_kernel(int_buf, float_buf, ext_count, thresh):
+    idx = cuda.grid(1)
+    if idx >= ext_count[0]:
+        return
+    o = int_buf[idx, 0]
+    if o == -1:
+        return
+    v = ld.fabsf(float_buf[idx, 3])
+    eps = numba.float32(1e-6)
+    eff = thresh - eps
+    if v <= eff:
+        int_buf[idx, 0] = -1
 
 
 def upscale(src, dst, delta_min):
@@ -398,40 +565,68 @@ def gaussian_blur(img_in, img_out, scratch, sigma):
     gauss_h[h_grid, (th,), 0, (th + 2 * r) * 4](scratch, img_out, g_dev, r)
 
 
-def compute_gss(data: SiftData, params: SiftParams, o: int):
-    gss = data.gss[o]
-    scratch = data.scratch[o]
-    ns = params.n_spo + 3
-    for s in range(1, ns):
-        gaussian_blur(gss[s - 1], gss[s], scratch, params.inc_sigmas[o, s])
+def gradient(img_in, gx_out, gy_out, stream=0):
+    h, w = img_in.shape
+    grid = ((w + TX - 1) // TX, (h + TY - 1) // TY)
+    gradient_kernel[grid, (TX, TY), stream](img_in, gx_out, gy_out)
 
 
-def compute_dog(data: SiftData, p: SiftParams, o: int):
-    gss, dog = data.gss[o], data.dog[o]
-    h, w = p.gss_shapes[o]
-    ns = p.n_spo + 2
-    threads = (16, 16, 4)  # (x, y, z)
+def compute_gss(
+    data: SiftData, params: SiftParams, octave_index: int, record: bool = False
+):
+    gss = data.gss[octave_index]
+    grad_x = data.grad_x[octave_index]
+    grad_y = data.grad_y[octave_index]
+    scratch = data.scratch[octave_index]
+    num_scales_total = params.n_spo + 3
+    # Compute derivatives with consistent naming: grad_x = dI/dx (columns), grad_y = dI/dy (rows)
+    gradient(gss[0], grad_x[0], grad_y[0])
+    for scale_index in range(1, num_scales_total):
+        gaussian_blur(
+            gss[scale_index - 1],
+            gss[scale_index],
+            scratch,
+            params.inc_sigmas[octave_index, scale_index],
+        )
+        gradient(gss[scale_index], grad_x[scale_index], grad_y[scale_index])
+    if record:
+        return cp.asnumpy(gss), cp.asnumpy(grad_x), cp.asnumpy(grad_y)
+    return None, None, None
+
+
+def compute_dog(
+    data: SiftData, params: SiftParams, octave_index: int, record: bool = False
+):
+    gss, dog = data.gss[octave_index], data.dog[octave_index]
+    height, width = params.gss_shapes[octave_index]
+    num_scales = params.n_spo + 2
+    threads = (16, 16, 4)
     grid = (
-        (w + threads[0] - 1) // threads[0],
-        (h + threads[1] - 1) // threads[1],
-        (ns + threads[2] - 1) // threads[2],
+        (width + threads[0] - 1) // threads[0],
+        (height + threads[1] - 1) // threads[1],
+        (num_scales + threads[2] - 1) // threads[2],
     )
     dog_diff_kernel[grid, threads](gss, dog)
+    if record:
+        return cp.asnumpy(dog)
+    return None
 
 
-def detect_extrema(data: SiftData, params: SiftParams, o: int):
+def detect_extrema(
+    data: SiftData, params: SiftParams, octave_index: int, record: bool = False
+):
     data.extrema.counter[0] = 0
-    dog_o = data.dog[o]
-    h, w = params.gss_shapes[o]
+    dog_octave = data.dog[octave_index]
+    height, width = params.gss_shapes[octave_index]
     threads = (2, 8, 8)
     blocks = (
         (params.n_spo + 2 + threads[0] - 1) // threads[0],
-        (h + threads[1] - 1) // threads[1],
-        (w + threads[2] - 1) // threads[2],
+        (height + threads[1] - 1) // threads[1],
+        (width + threads[2] - 1) // threads[2],
     )
     find_and_record_extrema_kernel[blocks, threads](
-        dog_o,
-        o,
+        dog_octave,
+        octave_index,
         data.extrema.int_buffer,
         data.extrema.float_buffer,
         data.extrema.counter,
@@ -439,13 +634,273 @@ def detect_extrema(data: SiftData, params: SiftParams, o: int):
         params.sigma_min,
         params.n_spo,
         params.delta_min,
+        numba.float32(0.0),
     )
+    if record:
+        n = int(cp.asnumpy(data.extrema.counter)[0])
+        if n > 0:
+            return (
+                cp.asnumpy(data.extrema.int_buffer[:n]),
+                cp.asnumpy(data.extrema.float_buffer[:n]),
+            )
+        return None
 
 
-def compute_octave(data: SiftData, params: SiftParams, o: int):
-    compute_gss(data, params, o)
-    compute_dog(data, params, o)
-    detect_extrema(data, params, o)
+def refine_extrema(
+    data: SiftData, params: SiftParams, octave_index: int, record: bool = False
+):
+    threads = 128
+    blocks = (params.max_extrema + threads - 1) // threads
+    refine_kernel[blocks, threads](
+        data.dog[octave_index],
+        data.extrema.int_buffer,
+        data.extrema.float_buffer,
+        data.extrema.counter,
+        params.n_spo,
+        params.sigma_min,
+        params.delta_min,
+    )
+    if record:
+        n = int(cp.asnumpy(data.extrema.counter)[0])
+        if n > 0:
+            ib = cp.asnumpy(data.extrema.int_buffer[:n])
+            fb = cp.asnumpy(data.extrema.float_buffer[:n])
+            mask = ib[:, 0] != -1
+            return (ib[mask], fb[mask])
+        return None
+
+
+def filter_extrema(
+    data: SiftData, params: SiftParams, octave_index: int, record: bool = False
+):
+    threads = 128
+    blocks = (params.max_extrema + threads - 1) // threads
+    filter_kernel[blocks, threads](
+        data.dog[octave_index],
+        data.extrema.int_buffer,
+        data.extrema.float_buffer,
+        data.extrema.counter,
+        params.C_dog,
+        params.C_edge,
+    )
+    if record:
+        n = int(cp.asnumpy(data.extrema.counter)[0])
+        if n > 0:
+            ib = cp.asnumpy(data.extrema.int_buffer[:n])
+            fb = cp.asnumpy(data.extrema.float_buffer[:n])
+            mask = ib[:, 0] != -1
+            return (ib[mask], fb[mask])
+        return None
+
+
+def discard_with_low_response(
+    data: SiftData, params: SiftParams, multiplier: float = 1.0, record: bool = False
+):
+    num_extrema = int(cp.asnumpy(data.extrema.counter)[0])
+    if num_extrema <= 0:
+        return None
+    thresh = numba.float32(float(params.C_dog) * float(multiplier))
+    threads = 128
+    blocks = (data.extrema.int_buffer.shape[0] + threads - 1) // threads
+    discard_with_low_response_kernel[blocks, threads](
+        data.extrema.int_buffer,
+        data.extrema.float_buffer,
+        data.extrema.counter,
+        thresh,
+    )
+    if record:
+        ib_h = cp.asnumpy(data.extrema.int_buffer[:num_extrema])
+        fb_h = cp.asnumpy(data.extrema.float_buffer[:num_extrema])
+        mask = ib_h[:, 0] != -1
+        return (ib_h[mask], fb_h[mask])
+    return None
+
+
+@cuda.jit(cache=True)
+def compute_edge_response_kernel(dog_oct, int_buf, float_buf, ext_count):
+    idx = cuda.grid(1)
+    if idx >= ext_count[0]:
+        return
+    o = int_buf[idx, 0]
+    if o == -1:
+        return
+    s = int_buf[idx, 1]
+    i = int_buf[idx, 2]
+    j = int_buf[idx, 3]
+    ns, h, w = dog_oct.shape
+    if not (1 <= s < ns - 1 and 1 <= i < h - 1 and 1 <= j < w - 1):
+        float_buf[idx, 4] = 1e30
+        return
+    im = dog_oct[s]
+    hXX = im[i - 1, j] + im[i + 1, j] - 2 * im[i, j]
+    hYY = im[i, j + 1] + im[i, j - 1] - 2 * im[i, j]
+    hXY = 0.25 * (
+        (im[i + 1, j + 1] - im[i + 1, j - 1]) - (im[i - 1, j + 1] - im[i - 1, j - 1])
+    )
+    det = hXX * hYY - hXY * hXY
+    if det <= 0:
+        float_buf[idx, 4] = 1e30
+        return
+    trace = hXX + hYY
+    float_buf[idx, 4] = (trace * trace) / det
+
+
+@cuda.jit(cache=True)
+def discard_on_edge_kernel(dog_oct, int_buf, ext_count, C_edge):
+    idx = cuda.grid(1)
+    if idx >= ext_count[0]:
+        return
+    o = int_buf[idx, 0]
+    if o == -1:
+        return
+    s = int_buf[idx, 1]
+    i = int_buf[idx, 2]
+    j = int_buf[idx, 3]
+    ns, h, w = dog_oct.shape
+    if not (1 <= s < ns - 1 and 1 <= i < h - 1 and 1 <= j < w - 1):
+        int_buf[idx, 0] = -1
+        return
+    im = dog_oct[s]
+    hXX = im[i - 1, j] + im[i + 1, j] - 2 * im[i, j]
+    hYY = im[i, j + 1] + im[i, j - 1] - 2 * im[i, j]
+    hXY = numba.float32(0.25) * (
+        (im[i + 1, j + 1] - im[i + 1, j - 1]) - (im[i - 1, j + 1] - im[i - 1, j - 1])
+    )
+    det = hXX * hYY - hXY * hXY
+    if det <= 0:
+        int_buf[idx, 0] = -1
+        return
+    trace = hXX + hYY
+    r = C_edge
+    if (trace * trace) / det > ((r + 1.0) * (r + 1.0) / r):
+        int_buf[idx, 0] = -1
+        return
+
+
+@cuda.jit(device=True, inline=True, cache=True)
+def wrap_angle(theta: numba.float32) -> numba.float32:
+    return ld.fmodf(ld.fmodf(theta, TWO_PI) + TWO_PI, TWO_PI)
+
+
+@cuda.jit(cache=True)
+def gradient_kernel(img, mag, ang):
+    x, y = cuda.grid(2)
+    h, w = img.shape
+    if x >= w or y >= h:
+        return
+
+    # Horizontal derivative gx (d/dx): central difference in interior,
+    # forward/backward difference on borders to mirror C implementation.
+    if 0 < x < w - 1:
+        gx = numba.float32(0.5) * (img[y, x + 1] - img[y, x - 1])
+    elif x == 0 and w > 1:
+        gx = img[y, 1] - img[y, 0]
+    elif x == w - 1 and w > 1:
+        gx = img[y, w - 1] - img[y, w - 2]
+    else:
+        gx = numba.float32(0.0)
+
+    # Vertical derivative gy (d/dy)
+    if 0 < y < h - 1:
+        gy = numba.float32(0.5) * (img[y + 1, x] - img[y - 1, x])
+    elif y == 0 and h > 1:
+        gy = img[1, x] - img[0, x]
+    elif y == h - 1 and h > 1:
+        gy = img[h - 1, x] - img[h - 2, x]
+    else:
+        gy = numba.float32(0.0)
+
+    # Output raw derivatives instead of mag/ang (rename via wrapper below)
+    mag[y, x] = gx
+    ang[y, x] = gy
+
+
+def discard_on_edge(
+    data: SiftData, params: SiftParams, octave_index: int, record: bool = False
+):
+    num_extrema = int(cp.asnumpy(data.extrema.counter)[0])
+    if num_extrema <= 0:
+        return None
+    threads = 128
+    blocks = (data.extrema.int_buffer.shape[0] + threads - 1) // threads
+    discard_on_edge_kernel[blocks, threads](
+        data.dog[octave_index],
+        data.extrema.int_buffer,
+        data.extrema.counter,
+        numba.float32(params.C_edge),
+    )
+    if record:
+        ib_h = cp.asnumpy(data.extrema.int_buffer[:num_extrema])
+        fb_h = cp.asnumpy(data.extrema.float_buffer[:num_extrema])
+        mask = ib_h[:, 0] != -1
+        return (ib_h[mask], fb_h[mask])
+    return None
+
+
+def discard_near_the_border(
+    data: SiftData, params: SiftParams, octave_index: int, record: bool = False
+):
+    num_extrema = int(cp.asnumpy(data.extrema.counter)[0])
+    if num_extrema <= 0:
+        return None
+    image_height, image_width = params.img_dims
+    threads = 128
+    blocks = (data.extrema.int_buffer.shape[0] + threads - 1) // threads
+    discard_near_the_border_kernel[blocks, threads](
+        data.extrema.int_buffer,
+        data.extrema.float_buffer,
+        data.extrema.counter,
+        int(image_height),
+        int(image_width),
+        numba.float32(1.0),
+    )
+    if record:
+        ib_h = cp.asnumpy(data.extrema.int_buffer[:num_extrema])
+        fb_h = cp.asnumpy(data.extrema.float_buffer[:num_extrema])
+        mask = ib_h[:, 0] != -1
+        return (ib_h[mask], fb_h[mask])
+    return None
+
+
+@cuda.jit(cache=True)
+def discard_near_the_border_kernel(
+    int_buf, float_buf, ext_count, image_h, image_w, lam
+):
+    idx = cuda.grid(1)
+    if idx >= ext_count[0]:
+        return
+    o = int_buf[idx, 0]
+    if o == -1:
+        return
+    y = float_buf[idx, 0]
+    x = float_buf[idx, 1]
+    sigma = float_buf[idx, 2]
+    if not (
+        (y - lam * sigma > numba.float32(0.0))
+        and (y + lam * sigma < numba.float32(image_h))
+        and (x - lam * sigma > numba.float32(0.0))
+        and (x + lam * sigma < numba.float32(image_w))
+    ):
+        int_buf[idx, 0] = -1
+
+
+def compute_octave(
+    data: SiftData, params: SiftParams, octave_index: int, *, record: bool = False
+) -> Optional[Dict[str, object]]:
+    snapshot: dict[str, object] = {}
+
+    snapshot["gss"], snapshot["grad_x"], snapshot["grad_y"] = compute_gss(
+        data, params, octave_index, record
+    )
+    snapshot["dog"] = compute_dog(data, params, octave_index, record)
+    snapshot["extrema"] = detect_extrema(data, params, octave_index, record)
+    snapshot["contrast_pre"] = discard_with_low_response(data, params, 0.8, record)
+    snapshot["refined"] = refine_extrema(data, params, octave_index, record)
+    snapshot["contrast_post"] = discard_with_low_response(data, params, 1.0, record)
+    snapshot["edge"] = discard_on_edge(data, params, octave_index, record)
+    snapshot["border"] = discard_near_the_border(data, params, octave_index, record)
+
+    return snapshot
 
 
 def set_seed(data: SiftData, params: SiftParams):
@@ -456,19 +911,24 @@ def set_seed(data: SiftData, params: SiftParams):
     )
 
 
-def set_first_scale(data: SiftData, params: SiftParams, o: int):
-    src, dst = data.gss[o - 1][params.n_spo], data.gss[o][0]
-    h, w = params.gss_shapes[o]
-    grid = ((w + TX - 1) // TX, (h + TY - 1) // TY)
+def set_first_scale(data: SiftData, params: SiftParams, octave_index: int):
+    src, dst = data.gss[octave_index - 1][params.n_spo], data.gss[octave_index][0]
+    height, width = params.gss_shapes[octave_index]
+    grid = ((width + TX - 1) // TX, (height + TY - 1) // TY)
     downsample_kernel[grid, (TX, TY)](src, dst)
 
 
-def compute(data: SiftData, params: SiftParams):
+def compute(
+    data: SiftData, params: SiftParams, *, record: bool = False
+) -> list[dict[str, object]]:
+    snapshots: list[dict[str, object]] = []
     set_seed(data, params)
-    for o in range(params.n_oct):
-        compute_octave(data, params, o)
-        if o < params.n_oct - 1:
-            set_first_scale(data, params, o + 1)
+    for octave_index in range(params.n_oct):
+        snapshot = compute_octave(data, params, octave_index, record=record)
+        snapshots.append(snapshot)
+        if octave_index < params.n_oct - 1:
+            set_first_scale(data, params, octave_index + 1)
+    return snapshots
 
 
 if __name__ == "__main__":
@@ -478,7 +938,6 @@ if __name__ == "__main__":
     sift_params = SiftParams(img.shape)
     sift_data = create_sift_data(sift_params)
 
-    # copy to GPU (float32)
     sift_data.input_img[...] = cp.asarray(img, dtype=cp.float32)
 
     compute(sift_data, sift_params)
