@@ -12,6 +12,7 @@ import math
 import warnings
 from numba.core.errors import NumbaPerformanceWarning
 import os
+import cupy as cp
 
 
 os.environ["NUMBA_CUDA_ARRAY_INTERFACE_SYNC"] = "0"
@@ -514,43 +515,6 @@ def refine_kernel(
 
 
 @cuda.jit(cache=True)
-def filter_kernel(dog_oct, int_buf, float_buf, ext_count, C_dog, C_edge, oct_idx):
-    idx = cuda.grid(1)
-    if idx >= ext_count[0]:
-        return
-    o = int_buf[idx, 0]
-    if o != oct_idx:
-        return
-    s, y, x = int_buf[idx, 1], int_buf[idx, 2], int_buf[idx, 3]
-    ns, h, w = dog_oct.shape
-    if not (1 <= s < ns - 1 and 1 <= y < h - 1 and 1 <= x < w - 1):
-        int_buf[idx, 0] = -1
-        return
-
-    if ld.fabsf(float_buf[idx, 3]) < C_dog:
-        int_buf[idx, 0] = -1
-        return
-
-    Hxx = dog_oct[s, y + 1, x] + dog_oct[s, y - 1, x] - 2 * dog_oct[s, y, x]
-    Hyy = dog_oct[s, y, x + 1] + dog_oct[s, y, x - 1] - 2 * dog_oct[s, y, x]
-    Hxy = 0.25 * (
-        dog_oct[s, y + 1, x + 1]
-        - dog_oct[s, y + 1, x - 1]
-        - dog_oct[s, y - 1, x + 1]
-        + dog_oct[s, y - 1, x - 1]
-    )
-    det = Hxx * Hyy - Hxy * Hxy
-    if det <= 0:
-        int_buf[idx, 0] = -1
-        return
-    trace = Hxx + Hyy
-    r = C_edge
-    if (trace * trace) / det > ((r + 1) * (r + 1) / r):
-        int_buf[idx, 0] = -1
-        return
-
-
-@cuda.jit(cache=True)
 def discard_with_low_response_kernel(int_buf, float_buf, ext_count, thresh, oct_idx):
     idx = cuda.grid(1)
     if idx >= ext_count[0]:
@@ -627,7 +591,6 @@ def compute_gss(
     octave_index: int,
     stream,
     record: bool = False,
-    ready_event=None,
 ):
     gss = data.gss[octave_index]
     grad_x = data.grad_x[octave_index]
@@ -647,11 +610,12 @@ def compute_gss(
             radius,
         )
         gradient(gss[scale_index], grad_x[scale_index], grad_y[scale_index], stream)
-        # Signal readiness for the next octave once gss[o][n_spo] is produced
-        if ready_event is not None and scale_index == params.n_spo:
-            ready_event.record(stream)
     if record:
-        return gss.copy_to_host(), grad_x.copy_to_host(), grad_y.copy_to_host()
+        return (
+            gss.copy_to_host(stream=stream),
+            grad_x.copy_to_host(stream=stream),
+            grad_y.copy_to_host(stream=stream),
+        )
     return None, None, None
 
 
@@ -669,7 +633,7 @@ def compute_dog(
     )
     dog_diff_kernel[grid, threads, stream](gss, dog)
     if record:
-        return dog.copy_to_host()
+        return dog.copy_to_host(stream=stream)
     return None
 
 
@@ -696,10 +660,10 @@ def detect_extrema(
         params.delta_min,
     )
     if record:
-        n = int(data.extrema.counter.copy_to_host()[0])
+        n = int(data.extrema.counter.copy_to_host(stream=stream)[0])
         if n > 0:
-            ib = data.extrema.int_buffer[:n].copy_to_host()
-            fb = data.extrema.float_buffer[:n].copy_to_host()
+            ib = data.extrema.int_buffer[:n].copy_to_host(stream=stream)
+            fb = data.extrema.float_buffer[:n].copy_to_host(stream=stream)
             mask = ib[:, 0] == octave_index
             if mask.any():
                 return (ib[mask], fb[mask])
@@ -722,34 +686,10 @@ def refine_extrema(
         octave_index,
     )
     if record:
-        n = int(data.extrema.counter.copy_to_host()[0])
+        n = int(data.extrema.counter.copy_to_host(stream=stream)[0])
         if n > 0:
-            ib = data.extrema.int_buffer[:n].copy_to_host()
-            fb = data.extrema.float_buffer[:n].copy_to_host()
-            mask = ib[:, 0] == octave_index
-            return (ib[mask], fb[mask])
-        return None
-
-
-def filter_extrema(
-    data: SiftData, params: SiftParams, octave_index: int, record: bool = False
-):
-    threads = 128
-    blocks = (params.max_extrema + threads - 1) // threads
-    filter_kernel[blocks, threads](
-        data.dog[octave_index],
-        data.extrema.int_buffer,
-        data.extrema.float_buffer,
-        data.extrema.counter,
-        params.C_dog,
-        params.C_edge,
-        octave_index,
-    )
-    if record:
-        n = int(data.extrema.counter.copy_to_host()[0])
-        if n > 0:
-            ib = data.extrema.int_buffer[:n].copy_to_host()
-            fb = data.extrema.float_buffer[:n].copy_to_host()
+            ib = data.extrema.int_buffer[:n].copy_to_host(stream=stream)
+            fb = data.extrema.float_buffer[:n].copy_to_host(stream=stream)
             mask = ib[:, 0] == octave_index
             return (ib[mask], fb[mask])
         return None
@@ -774,9 +714,9 @@ def discard_with_low_response(
         octave_index,
     )
     if record:
-        total = int(data.extrema.counter.copy_to_host()[0])
-        ib_h = data.extrema.int_buffer[:total].copy_to_host()
-        fb_h = data.extrema.float_buffer[:total].copy_to_host()
+        total = int(data.extrema.counter.copy_to_host(stream=stream)[0])
+        ib_h = data.extrema.int_buffer[:total].copy_to_host(stream=stream)
+        fb_h = data.extrema.float_buffer[:total].copy_to_host(stream=stream)
         mask = ib_h[:, 0] == octave_index
         return (ib_h[mask], fb_h[mask])
     return None
@@ -961,9 +901,9 @@ def discard_on_edge(
         octave_index,
     )
     if record:
-        total = int(data.extrema.counter.copy_to_host()[0])
-        ib_h = data.extrema.int_buffer[:total].copy_to_host()
-        fb_h = data.extrema.float_buffer[:total].copy_to_host()
+        total = int(data.extrema.counter.copy_to_host(stream=stream)[0])
+        ib_h = data.extrema.int_buffer[:total].copy_to_host(stream=stream)
+        fb_h = data.extrema.float_buffer[:total].copy_to_host(stream=stream)
         mask = ib_h[:, 0] == octave_index
         return (ib_h[mask], fb_h[mask])
     return None
@@ -1143,11 +1083,11 @@ def build_descriptors(
     )
 
     if record:
-        total = int(data.keypoints.counter.copy_to_host()[0])
+        total = int(data.keypoints.counter.copy_to_host(stream=stream)[0])
         if total > 0:
-            ib = data.keypoints.int_buffer[:total].copy_to_host()
-            fb = data.keypoints.float_buffer[:total].copy_to_host()
-            desc = data.keypoints.descriptors[:total].copy_to_host()
+            ib = data.keypoints.int_buffer[:total].copy_to_host(stream=stream)
+            fb = data.keypoints.float_buffer[:total].copy_to_host(stream=stream)
+            desc = data.keypoints.descriptors[:total].copy_to_host(stream=stream)
             mask = ib[:, 0] == octave_index
             ints = ib[mask]
             flts = fb[mask]
@@ -1163,7 +1103,6 @@ def compute_octave(
     octave_index: int,
     stream,
     record: bool = False,
-    ready_event=None,
 ) -> Optional[Dict[str, object]]:
     snapshot: dict[str, object] = {}
 
@@ -1173,7 +1112,7 @@ def compute_octave(
         set_first_scale(data, params, octave_index, stream)
 
     snapshot["gss"], snapshot["grad_x"], snapshot["grad_y"] = compute_gss(
-        data, params, octave_index, stream, record, ready_event=ready_event
+        data, params, octave_index, stream, record
     )
     snapshot["dog"] = compute_dog(data, params, octave_index, stream, record)
     snapshot["extrema"] = detect_extrema(data, params, octave_index, stream, record)
@@ -1216,24 +1155,17 @@ def set_first_scale(data: SiftData, params: SiftParams, octave_index: int, strea
 
 
 def compute(
-    data: SiftData, params: SiftParams, *, record: bool = False
+    data: SiftData, params: SiftParams, nb_stream, img, record: bool = False
 ) -> list[dict[str, object]]:
     snapshots: list[dict[str, object]] = []
 
-    streams = [cuda.stream() for _ in range(params.n_oct)]
-    ready_events = [cuda.event() for _ in range(params.n_oct)]
+    sift_data.input_img.copy_to_device(img.astype(np.float32))
+    sift_data.extrema.counter.copy_to_device(np.array([0, 0], dtype=np.int32))
+    sift_data.keypoints.counter.copy_to_device(np.array([0, 0], dtype=np.int32))
 
     for o in range(params.n_oct):
-        stream = streams[o]
-        if o > 0:
-            ready_events[o - 1].wait(stream)
-        snapshot = compute_octave(
-            data, params, o, stream, record, ready_event=ready_events[o]
-        )
+        snapshot = compute_octave(data, params, o, nb_stream, record)
         snapshots.append(snapshot)
-
-    for stream in streams:
-        stream.synchronize()
 
     return snapshots
 
@@ -1245,8 +1177,8 @@ if __name__ == "__main__":
     sift_params = SiftParams(img.shape)
     sift_data = create_sift_data(sift_params)
 
-    sift_data.input_img.copy_to_device(img.astype(np.float32))
+    cp_stream = cp.cuda.Stream(non_blocking=True)
+    nb_stream = cuda.external_stream(cp_stream.ptr)
 
-    compute(sift_data, sift_params)
-
-    print(sift_data.keypoints.counter.copy_to_host())
+    for i in range(10):
+        compute(sift_data, sift_params, nb_stream, img)
