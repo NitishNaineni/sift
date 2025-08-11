@@ -308,14 +308,16 @@ int main(int argc, char **argv)
         nw = snprintf(path, sizeof(path), "%s/%s", dump_all_dir, "dog");
         if (nw < 0 || (size_t)nw >= sizeof(path)) fatal_error("Path too long for dog");
         dump_scalespace_raw_to_dir(ss[1], path, "dog");
-        /* grad_x */
+        /* grad_x (dI/dx) */
         nw = snprintf(path, sizeof(path), "%s/%s", dump_all_dir, "grad_x");
         if (nw < 0 || (size_t)nw >= sizeof(path)) fatal_error("Path too long for grad_x");
-        dump_scalespace_raw_to_dir(ss[2], path, "grad_x");
-        /* grad_y */
+        /* Note: ensure grad_x directory contains the horizontal derivative */
+        dump_scalespace_raw_to_dir(ss[3], path, "grad_x");
+        /* grad_y (dI/dy) */
         nw = snprintf(path, sizeof(path), "%s/%s", dump_all_dir, "grad_y");
         if (nw < 0 || (size_t)nw >= sizeof(path)) fatal_error("Path too long for grad_y");
-        dump_scalespace_raw_to_dir(ss[3], path, "grad_y");
+        /* Note: ensure grad_y directory contains the vertical derivative */
+        dump_scalespace_raw_to_dir(ss[2], path, "grad_y");
         /* extrema (kA) */
         nw = snprintf(path, sizeof(path), "%s/%s", dump_all_dir, "extrema");
         if (nw < 0 || (size_t)nw >= sizeof(path)) fatal_error("Path too long for extrema");
@@ -527,11 +529,20 @@ static void dump_oriented_keypoints_to_dir(const struct sift_keypoints* keys, co
             nd = key->n_hist * key->n_hist * key->n_ori;
             if (nd <= 0) nd = 128;
         }
-        for (int j = 0; j < nd; j++) {
-            float v = key->descr ? key->descr[j] : 0.0f;
-            if (v < 0.0f) v = 0.0f;
-            if (v > 255.0f) v = 255.0f;
-            buf_d[(size_t)k * (size_t)nd + (size_t)j] = (unsigned char)(v + 0.5f);
+        /* Write descriptor in u-major order (u, v, o) */
+        int NH = key->n_hist;
+        int NO = key->n_ori;
+        for (int u = 0; u < NH; ++u) {
+            for (int v = 0; v < NH; ++v) {
+                for (int o = 0; o < NO; ++o) {
+                    int src = (v * NH + u) * NO + o; /* in-memory v-major */
+                    int dst = (u * NH + v) * NO + o; /* serialized u-major */
+                    float vv = key->descr ? key->descr[src] : 0.0f;
+                    if (vv < 0.0f) vv = 0.0f;
+                    if (vv > 255.0f) vv = 255.0f;
+                    buf_d[(size_t)k * (size_t)nd + (size_t)dst] = (unsigned char)(vv + 0.5f);
+                }
+            }
         }
     }
 

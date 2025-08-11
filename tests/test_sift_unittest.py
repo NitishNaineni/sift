@@ -48,7 +48,14 @@ class TestSiftCompute(unittest.TestCase):
 
         try:
             subprocess.run(
-                ["make", "-C", str(cls.root / "sift_anatomy")],
+                ["make", "-C", str(cls.root / "sift_anatomy"), "clean"],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            subprocess.run(
+                ["make", "-C", str(cls.root / "sift_anatomy"), "BINFLAGS=-O3"],
                 check=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -56,6 +63,11 @@ class TestSiftCompute(unittest.TestCase):
             )
         except Exception as e:
             raise unittest.SkipTest(f"Failed to build sift_cli: {e}")
+        # Always regenerate dumps into a fresh directory
+        if cls.record_dir.exists():
+            import shutil
+
+            shutil.rmtree(cls.record_dir)
         cls.record_dir.mkdir(parents=True, exist_ok=True)
         try:
             subprocess.run(
@@ -181,10 +193,10 @@ class TestSiftCompute(unittest.TestCase):
                 gx_cli = self._load_matrix(dir_x / fxname, h, w)
                 gy_cli = self._load_matrix(dir_y / fyname, h, w)
                 pgx, pgy = grad_x[s], grad_y[s]
-                self.assertEqual(gx_cli.shape, pgy.shape)
-                self.assertEqual(gy_cli.shape, pgx.shape)
-                self.assertLessEqual(np.max(np.abs(gx_cli - pgy)), tol)
-                self.assertLessEqual(np.max(np.abs(gy_cli - pgx)), tol)
+                self.assertEqual(gx_cli.shape, pgx.shape)
+                self.assertEqual(gy_cli.shape, pgy.shape)
+                self.assertLessEqual(np.max(np.abs(gx_cli - pgx)), tol)
+                self.assertLessEqual(np.max(np.abs(gy_cli - pgy)), tol)
 
     def test_oriented_keypoints_match_cli_dump(self):
         keys_dir = self.record_dir / "keys"
