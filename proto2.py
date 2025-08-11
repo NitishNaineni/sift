@@ -903,7 +903,6 @@ def orientation_kernel(
 
             a = wrap_angle(ld.atan2f(gx, gy))
             wgt = m * ld.expf(-(dxf * dxf + dyf * dyf) * inv_2sig2)
-            # Match C: single-bin accumulation with +0.5 rounding
             bin_f = a * bin_scale + numba.float32(0.5)
             bin_i = int(ld.floorf(bin_f)) % ORI_BINS
             if bin_i < 0:
@@ -1031,27 +1030,21 @@ def descriptor_kernel(
     scale = delta_min * (1 << oct_idx)
     x0, y0 = xw / scale, yw / scale
     radiusF = LAMBDA_DESC * sigma / scale
-    # C uses t = lambda_descr * sigma_key as Gaussian sigma. Our radiusF = lambda_descr*sigma.
-    # So inv_2sig2 = 1/(2*t^2) equals 1/(2*radiusF^2)
     inv_2sig2 = 1.0 / (2.0 * radiusF * radiusF)
     bin_scale = NORIBIN / TWO_PI
 
-    # Compute patch size exactly as C: R = (1+1/NHIST) * radiusF, Rp = sqrt(2) * R
     R = (1.0 + 1.0 / NHIST) * radiusF
     Rp = ld.sqrtf(2.0) * R
 
-    # Integer anchor point (rounded, not floored)
-    xi0 = int(ld.floorf(x0 + 0.5))
-    yi0 = int(ld.floorf(y0 + 0.5))
-
-    # Patch size: side length = 2*Rp + 1, rounded
-    patch = int(Rp + 0.5) * 2 + 1
-
-    # Border check using the larger patch radius
-    dmin = int(Rp + 0.5)
     h, w = grad_x.shape[1:]
-    if xi0 < dmin or xi0 > w - 1 - dmin or yi0 < dmin or yi0 > h - 1 - dmin:
-        return
+    siMin = 0 if (y0 - Rp + 0.5) < 0.0 else int(y0 - Rp + 0.5)
+    sjMin = 0 if (x0 - Rp + 0.5) < 0.0 else int(x0 - Rp + 0.5)
+    siMax_f = y0 + Rp + 0.5
+    sjMax_f = x0 + Rp + 0.5
+    siMax = h - 1 if siMax_f > (h - 1) else int(siMax_f)
+    sjMax = w - 1 if sjMax_f > (w - 1) else int(sjMax_f)
+    height = max(0, siMax - siMin)
+    width = max(0, sjMax - sjMin)
 
     c, snt = ld.cosf(theta0), ld.sinf(theta0)
     hist = cuda.shared.array(DESC_LEN, numba.float32)
@@ -1059,27 +1052,25 @@ def descriptor_kernel(
     if tflat < DESC_LEN:
         hist[tflat] = 0.0
     cuda.syncthreads()
-    for py in range(cuda.threadIdx.y, patch, TY):
-        yy = yi0 - dmin + py
+    for py in range(cuda.threadIdx.y, height, TY):
+        yy = siMin + py
         dy0 = yy - y0
-        for px in range(cuda.threadIdx.x, patch, TX):
-            xx = xi0 - dmin + px
+        for px in range(cuda.threadIdx.x, width, TX):
+            xx = sjMin + px
             dx0 = xx - x0
-            # rotate spatial coordinates by -theta0 (match C: apply_rotation(..., -theta))
-            dx = dx0 * c - dy0 * snt
-            dy = dx0 * snt + dy0 * c
-            # Spatial binning matches C: alpha, beta in [-0.5, Nhist-0.5]
-            u = dx / (2.0 * radiusF / NHIST) + (NHIST - 1.0) * 0.5
-            v = dy / (2.0 * radiusF / NHIST) + (NHIST - 1.0) * 0.5
+
+            dx = dy0 * c + dx0 * snt
+            dy = -dy0 * snt + dx0 * c
+            u = dy / (2.0 * radiusF / NHIST) + (NHIST - 1.0) * 0.5
+            v = dx / (2.0 * radiusF / NHIST) + (NHIST - 1.0) * 0.5
             R = (1.0 + 1.0 / NHIST) * radiusF
-            if ld.fabsf(dx) > R or ld.fabsf(dy) > R:
+            if not (ld.fabsf(dx) < R and ld.fabsf(dy) < R):
                 continue
             gx = grad_x[s, yy, xx]
             gy = grad_y[s, yy, xx]
             m = ld.sqrtf(gx * gx + gy * gy)
             if m == 0.0:
                 continue
-            # angle convention consistent with C: atan2(dI/dx, dI/dy)
             a = wrap_angle(ld.atan2f(gx, gy) - theta0)
             ob = a * bin_scale
             u0 = int(ld.floorf(u))
@@ -1100,9 +1091,7 @@ def descriptor_kernel(
                             for io in (0, 1):
                                 oo = (o0 + io) % NORIBIN
                                 wo = (1 - do) if io == 0 else do
-                                # TODO: Verify this indexing matches C implementation
-                                # Current: (vv * NHIST + uu) - may need (uu * NHIST + vv) instead
-                                hidx = ((vv * NHIST + uu) * NORIBIN) + oo
+                                hidx = ((uu * NHIST + vv) * NORIBIN) + oo
                                 cuda.atomic.add(hist, hidx, wbase * wu * wv * wo)
     cuda.syncthreads()
     if tflat == 0:
