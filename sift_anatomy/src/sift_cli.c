@@ -495,14 +495,23 @@ static void dump_oriented_keypoints_to_dir(const struct sift_keypoints* keys, co
 
     char path_int[FILENAME_MAX];
     char path_float[FILENAME_MAX];
+    char path_desc[FILENAME_MAX];
     char path_meta[FILENAME_MAX];
     snprintf(path_int, sizeof(path_int), "%s/%s", out_dir, "keys_int.i32");
     snprintf(path_float, sizeof(path_float), "%s/%s", out_dir, "keys_float.f32");
+    snprintf(path_desc, sizeof(path_desc), "%s/%s", out_dir, "keys_desc.u8");
     snprintf(path_meta, sizeof(path_meta), "%s/%s", out_dir, "keys_meta.json");
 
     int n = keys->size;
     int (*buf_i)[4] = (int (*)[4])xmalloc((size_t)n * 4 * sizeof(int));
     float (*buf_f)[4] = (float (*)[4])xmalloc((size_t)n * 4 * sizeof(float));
+    int nd = 0;
+    if (n > 0) {
+        const struct keypoint* k0 = keys->list[0];
+        nd = k0->n_hist * k0->n_hist * k0->n_ori;
+        if (nd <= 0) nd = 128; /* fallback */
+    }
+    unsigned char* buf_d = (unsigned char*)xmalloc((size_t)(n > 0 ? n : 1) * (size_t)(nd > 0 ? nd : 128));
 
     for (int k = 0; k < n; k++) {
         const struct keypoint* key = keys->list[k];
@@ -514,6 +523,16 @@ static void dump_oriented_keypoints_to_dir(const struct sift_keypoints* keys, co
         buf_f[k][1] = key->y;     /* x_world */
         buf_f[k][2] = key->sigma; /* sigma */
         buf_f[k][3] = key->theta; /* orientation */
+        if (nd == 0) {
+            nd = key->n_hist * key->n_hist * key->n_ori;
+            if (nd <= 0) nd = 128;
+        }
+        for (int j = 0; j < nd; j++) {
+            float v = key->descr ? key->descr[j] : 0.0f;
+            if (v < 0.0f) v = 0.0f;
+            if (v > 255.0f) v = 255.0f;
+            buf_d[(size_t)k * (size_t)nd + (size_t)j] = (unsigned char)(v + 0.5f);
+        }
     }
 
     FILE* fi = fopen(path_int, "wb");
@@ -526,12 +545,21 @@ static void dump_oriented_keypoints_to_dir(const struct sift_keypoints* keys, co
     fwrite(buf_f, sizeof(float), (size_t)n * 4, ff);
     fclose(ff);
 
+    FILE* fd = fopen(path_desc, "wb");
+    if (!fd) fatal_error("Failed to open %s for writing", path_desc);
+    if (n > 0 && nd > 0) {
+        fwrite(buf_d, sizeof(unsigned char), (size_t)n * (size_t)nd, fd);
+    }
+    fclose(fd);
+
     FILE* fm = fopen(path_meta, "w");
     if (!fm) fatal_error("Failed to open %s for writing", path_meta);
     fprintf(fm, "{\n");
     fprintf(fm, "  \"count\": %d,\n", n);
     fprintf(fm, "  \"int_file\": \"keys_int.i32\",\n");
     fprintf(fm, "  \"float_file\": \"keys_float.f32\",\n");
+    fprintf(fm, "  \"desc_file\": \"keys_desc.u8\",\n");
+    fprintf(fm, "  \"desc_len\": %d,\n", nd);
     fprintf(fm, "  \"int_order\": [\"o\", \"s\", \"i\", \"j\"],\n");
     fprintf(fm, "  \"float_order\": [\"y\", \"x\", \"sigma\", \"theta\"]\n");
     fprintf(fm, "}\n");
@@ -539,5 +567,6 @@ static void dump_oriented_keypoints_to_dir(const struct sift_keypoints* keys, co
 
     xfree(buf_i);
     xfree(buf_f);
+    xfree(buf_d);
 }
 

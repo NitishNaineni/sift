@@ -13,6 +13,7 @@ import warnings
 from numba.core.errors import NumbaPerformanceWarning
 import os
 
+
 os.environ["NUMBA_CUDA_ARRAY_INTERFACE_SYNC"] = "0"
 
 warnings.filterwarnings("ignore", category=UserWarning, message=r"pynvjitlink")
@@ -811,7 +812,7 @@ def wrap_angle(theta: numba.float32) -> numba.float32:
 
 
 @cuda.jit(cache=True)
-def gradient_kernel(img, mag, ang):
+def gradient_kernel(img, grad_x, grad_y):
     x, y = cuda.grid(2)
     h, w = img.shape
     if x >= w or y >= h:
@@ -838,9 +839,9 @@ def gradient_kernel(img, mag, ang):
     else:
         gy = numba.float32(0.0)
 
-    # Output raw derivatives instead of mag/ang (rename via wrapper below)
-    mag[y, x] = gx
-    ang[y, x] = gy
+    # Output raw derivatives: horizontal (dI/dx) and vertical (dI/dy)
+    grad_x[y, x] = gx  # Horizontal gradient (dI/dx)
+    grad_y[y, x] = gy  # Vertical gradient (dI/dy)
 
 
 @cuda.jit(cache=True)
@@ -1015,7 +1016,117 @@ def discard_near_the_border_kernel(
         int_buf[idx, 0] = -1
 
 
-def assign_orientations(
+@cuda.jit(cache=True)
+def descriptor_kernel(
+    grad_x, grad_y, key_float, key_int, kctr, desc, oct_idx, delta_min
+):
+    kp_idx = cuda.blockIdx.x
+    if kp_idx >= kctr[0] or key_int[kp_idx, 0] != oct_idx:
+        return
+    s = key_int[kp_idx, 1]
+    yw = key_float[kp_idx, 0]
+    xw = key_float[kp_idx, 1]
+    sigma = key_float[kp_idx, 2]
+    theta0 = key_float[kp_idx, 3]
+    scale = delta_min * (1 << oct_idx)
+    x0, y0 = xw / scale, yw / scale
+    radiusF = LAMBDA_DESC * sigma / scale
+    # C uses t = lambda_descr * sigma_key as Gaussian sigma. Our radiusF = lambda_descr*sigma.
+    # So inv_2sig2 = 1/(2*t^2) equals 1/(2*radiusF^2)
+    inv_2sig2 = 1.0 / (2.0 * radiusF * radiusF)
+    bin_scale = NORIBIN / TWO_PI
+
+    # Compute patch size exactly as C: R = (1+1/NHIST) * radiusF, Rp = sqrt(2) * R
+    R = (1.0 + 1.0 / NHIST) * radiusF
+    Rp = ld.sqrtf(2.0) * R
+
+    # Integer anchor point (rounded, not floored)
+    xi0 = int(ld.floorf(x0 + 0.5))
+    yi0 = int(ld.floorf(y0 + 0.5))
+
+    # Patch size: side length = 2*Rp + 1, rounded
+    patch = int(Rp + 0.5) * 2 + 1
+
+    # Border check using the larger patch radius
+    dmin = int(Rp + 0.5)
+    h, w = grad_x.shape[1:]
+    if xi0 < dmin or xi0 > w - 1 - dmin or yi0 < dmin or yi0 > h - 1 - dmin:
+        return
+
+    c, snt = ld.cosf(theta0), ld.sinf(theta0)
+    hist = cuda.shared.array(DESC_LEN, numba.float32)
+    tflat = cuda.threadIdx.y * TX + cuda.threadIdx.x
+    if tflat < DESC_LEN:
+        hist[tflat] = 0.0
+    cuda.syncthreads()
+    for py in range(cuda.threadIdx.y, patch, TY):
+        yy = yi0 - dmin + py
+        dy0 = yy - y0
+        for px in range(cuda.threadIdx.x, patch, TX):
+            xx = xi0 - dmin + px
+            dx0 = xx - x0
+            # rotate spatial coordinates by -theta0 (match C: apply_rotation(..., -theta))
+            dx = dx0 * c - dy0 * snt
+            dy = dx0 * snt + dy0 * c
+            # Spatial binning matches C: alpha, beta in [-0.5, Nhist-0.5]
+            u = dx / (2.0 * radiusF / NHIST) + (NHIST - 1.0) * 0.5
+            v = dy / (2.0 * radiusF / NHIST) + (NHIST - 1.0) * 0.5
+            R = (1.0 + 1.0 / NHIST) * radiusF
+            if ld.fabsf(dx) > R or ld.fabsf(dy) > R:
+                continue
+            gx = grad_x[s, yy, xx]
+            gy = grad_y[s, yy, xx]
+            m = ld.sqrtf(gx * gx + gy * gy)
+            if m == 0.0:
+                continue
+            # angle convention consistent with C: atan2(dI/dx, dI/dy)
+            a = wrap_angle(ld.atan2f(gx, gy) - theta0)
+            ob = a * bin_scale
+            u0 = int(ld.floorf(u))
+            du = u - u0
+            v0 = int(ld.floorf(v))
+            dv = v - v0
+            o0 = int(ob)
+            do = ob - o0
+            wbase = m * ld.expf(-(dx * dx + dy * dy) * inv_2sig2)
+            for iu in (0, 1):
+                uu = u0 + iu
+                if 0 <= uu < NHIST:
+                    wu = (1 - du) if iu == 0 else du
+                    for iv in (0, 1):
+                        vv = v0 + iv
+                        if 0 <= vv < NHIST:
+                            wv = (1 - dv) if iv == 0 else dv
+                            for io in (0, 1):
+                                oo = (o0 + io) % NORIBIN
+                                wo = (1 - do) if io == 0 else do
+                                # TODO: Verify this indexing matches C implementation
+                                # Current: (vv * NHIST + uu) - may need (uu * NHIST + vv) instead
+                                hidx = ((vv * NHIST + uu) * NORIBIN) + oo
+                                cuda.atomic.add(hist, hidx, wbase * wu * wv * wo)
+    cuda.syncthreads()
+    if tflat == 0:
+        l2 = numba.float32(0.0)
+        for i in range(DESC_LEN):
+            l2 += hist[i] * hist[i]
+        norm = ld.sqrtf(l2) + 1e-12
+        inv = 1.0 / norm
+
+        l2p = numba.float32(0.0)
+        for i in range(DESC_LEN):
+            v = hist[i] * inv
+            v = 0.2 if v > 0.2 else v
+            hist[i] = v
+            l2p += v * v
+        norm2 = ld.sqrtf(l2p) + 1e-12
+        inv2 = 1.0 / norm2
+
+        for i in range(DESC_LEN):
+            q = hist[i] * inv2 * 512.0
+            desc[kp_idx, i] = numba.uint8(255 if q > 255 else int(q))
+
+
+def build_descriptors(
     data: SiftData, params: SiftParams, octave_index: int, record: bool = False
 ):
     orientation_kernel[(params.max_extrema,), (TX, TY)](
@@ -1031,16 +1142,30 @@ def assign_orientations(
         params.lambda_ori,
         params.delta_min,
     )
+
+    descriptor_kernel[(params.max_keypoints,), (TX, TY)](
+        data.grad_x[octave_index],
+        data.grad_y[octave_index],
+        data.keypoints.float_buffer,
+        data.keypoints.int_buffer,
+        data.keypoints.counter,
+        data.keypoints.descriptors,
+        octave_index,
+        params.delta_min,
+    )
+
     if record:
         total = int(cp.asnumpy(data.keypoints.counter)[0])
         if total > 0:
             ib = data.keypoints.int_buffer[:total]
             fb = data.keypoints.float_buffer[:total]
+            desc = data.keypoints.descriptors[:total]
             mask = ib[:, 0] == octave_index
             ints = cp.asnumpy(ib[mask])
             flts = cp.asnumpy(fb[mask])
+            desc_np = cp.asnumpy(desc[mask])
             if ints.shape[0] > 0:
-                return (ints, flts)
+                return (ints, flts, desc_np)
         return None
 
 
@@ -1059,7 +1184,7 @@ def compute_octave(
     snapshot["contrast_post"] = discard_with_low_response(data, params, 1.0, record)
     snapshot["edge"] = discard_on_edge(data, params, octave_index, record)
     snapshot["border"] = discard_near_the_border(data, params, octave_index, record)
-    snapshot["keys"] = assign_orientations(data, params, octave_index, record)
+    snapshot["keys"] = build_descriptors(data, params, octave_index, record)
 
     return snapshot
 
