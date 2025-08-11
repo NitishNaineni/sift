@@ -17,9 +17,12 @@ class TestSiftCompute(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         try:
-            import cupy as cp  # noqa: F401
+            from numba import cuda  # noqa: F401
+
+            if not cuda.is_available():
+                raise unittest.SkipTest("Numba CUDA not available")
         except Exception:
-            raise unittest.SkipTest("CuPy not available")
+            raise unittest.SkipTest("Numba CUDA not available")
 
         cls.root = Path(__file__).resolve().parents[1]
         cls.img_path = cls.root / "data/oxford_affine/graf/img1.png"
@@ -37,9 +40,9 @@ class TestSiftCompute(unittest.TestCase):
         img = read_gray_bt709(str(cls.img_path))
         cls.params = SiftParams(img.shape)
         cls.data = create_sift_data(cls.params)
-        import cupy as cp
+        from numba import cuda
 
-        cls.data.input_img[...] = cp.asarray(img, dtype=cp.float32)
+        cls.data.input_img.copy_to_device(img.astype(np.float32))
         cls.snapshots = compute(cls.data, cls.params, record=True)
 
         cls.record_dir = cls.root / "tests/artifacts/record_c_output"
