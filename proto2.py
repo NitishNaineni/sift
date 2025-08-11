@@ -129,7 +129,7 @@ class Extrema:
 
 @dataclass
 class Keypoints:
-    int_buffer: cp.ndarray  # o, s, y_int, x_int (match Extrema layout)
+    int_buffer: cp.ndarray  # o, s, y_int, x_int
     float_buffer: cp.ndarray  # y_world, x_world, sigma, orientation
     descriptors: cp.ndarray  # 128-dim SIFT descriptor per keypoint (uint8)
     # keypoint count, overflow count
@@ -140,11 +140,11 @@ class Keypoints:
 class SiftData:
     input_img: cp.ndarray
     seed_img: cp.ndarray
-    scratch: list[cp.ndarray]
-    gss: list[cp.ndarray]
-    dog: list[cp.ndarray]
-    grad_x: list[cp.ndarray]
-    grad_y: list[cp.ndarray]
+    scratch: tuple[cp.ndarray, ...]
+    gss: tuple[cp.ndarray, ...]
+    dog: tuple[cp.ndarray, ...]
+    grad_x: tuple[cp.ndarray, ...]
+    grad_y: tuple[cp.ndarray, ...]
     extrema: Extrema
     keypoints: Keypoints
 
@@ -157,7 +157,6 @@ def _alloc_octave_tensors(params: SiftParams, octave_index: int):
     gss = cp.empty((num_gss_scales, height, width), np.float32)
     dog = cp.empty((num_dog_scales, height, width), np.float32)
     scratch = cp.empty((height, width), np.float32)
-    # Use CuPy arrays so we can easily move to host with cp.asnumpy
     grad_x = cp.empty((num_gss_scales, height, width), np.float32)
     grad_y = cp.empty((num_gss_scales, height, width), np.float32)
 
@@ -338,7 +337,6 @@ def find_and_record_extrema_kernel(
     sigma_min,
     n_spo,
     delta_min,
-    dog_pre_thresh,
 ):
     s, y, x = cuda.grid(3)
     ns, h, w = dog_oct.shape
@@ -564,7 +562,7 @@ def upscale(src, dst, delta_min):
     oversample_bilinear_kernel[grid, (TX, TY)](src, dst, numba.float32(delta_min))
 
 
-def gaussian_symm_kernel(sigma: float) -> tuple[np.ndarray, int]:
+def gaussian_symm_kernel(sigma: float) -> tuple[cp.ndarray, int]:
     radius = int(math.ceil(4.0 * float(sigma)))
 
     g = np.empty(radius + 1, dtype=np.float32)
@@ -663,7 +661,6 @@ def detect_extrema(
         params.sigma_min,
         params.n_spo,
         params.delta_min,
-        numba.float32(0.0),
     )
     if record:
         n = int(cp.asnumpy(data.extrema.counter)[0])
@@ -746,35 +743,6 @@ def discard_with_low_response(
 
 
 @cuda.jit(cache=True)
-def compute_edge_response_kernel(dog_oct, int_buf, float_buf, ext_count):
-    idx = cuda.grid(1)
-    if idx >= ext_count[0]:
-        return
-    o = int_buf[idx, 0]
-    if o == -1:
-        return
-    s = int_buf[idx, 1]
-    i = int_buf[idx, 2]
-    j = int_buf[idx, 3]
-    ns, h, w = dog_oct.shape
-    if not (1 <= s < ns - 1 and 1 <= i < h - 1 and 1 <= j < w - 1):
-        float_buf[idx, 4] = 1e30
-        return
-    im = dog_oct[s]
-    hXX = im[i - 1, j] + im[i + 1, j] - 2 * im[i, j]
-    hYY = im[i, j + 1] + im[i, j - 1] - 2 * im[i, j]
-    hXY = 0.25 * (
-        (im[i + 1, j + 1] - im[i + 1, j - 1]) - (im[i - 1, j + 1] - im[i - 1, j - 1])
-    )
-    det = hXX * hYY - hXY * hXY
-    if det <= 0:
-        float_buf[idx, 4] = 1e30
-        return
-    trace = hXX + hYY
-    float_buf[idx, 4] = (trace * trace) / det
-
-
-@cuda.jit(cache=True)
 def discard_on_edge_kernel(dog_oct, int_buf, ext_count, C_edge):
     idx = cuda.grid(1)
     if idx >= ext_count[0]:
@@ -818,8 +786,6 @@ def gradient_kernel(img, grad_x, grad_y):
     if x >= w or y >= h:
         return
 
-    # Horizontal derivative gx (d/dx): central difference in interior,
-    # forward/backward difference on borders to mirror C implementation.
     if 0 < x < w - 1:
         gx = numba.float32(0.5) * (img[y, x + 1] - img[y, x - 1])
     elif x == 0 and w > 1:
@@ -829,7 +795,6 @@ def gradient_kernel(img, grad_x, grad_y):
     else:
         gx = numba.float32(0.0)
 
-    # Vertical derivative gy (d/dy)
     if 0 < y < h - 1:
         gy = numba.float32(0.5) * (img[y + 1, x] - img[y - 1, x])
     elif y == 0 and h > 1:
@@ -839,9 +804,8 @@ def gradient_kernel(img, grad_x, grad_y):
     else:
         gy = numba.float32(0.0)
 
-    # Output raw derivatives: horizontal (dI/dx) and vertical (dI/dy)
-    grad_x[y, x] = gx  # Horizontal gradient (dI/dx)
-    grad_y[y, x] = gy  # Vertical gradient (dI/dy)
+    grad_x[y, x] = gx
+    grad_y[y, x] = gy
 
 
 @cuda.jit(cache=True)
@@ -862,7 +826,6 @@ def orientation_kernel(
     if kp_idx >= n_extrema[0] or int_buf[kp_idx, 0] != oct_idx:
         return
     s = int_buf[kp_idx, 1]
-    # Use refined subpixel/world coordinates converted to octave coords
     scale = delta_min * (1 << oct_idx)
     y0 = float_buf[kp_idx, 0] / scale
     x0 = float_buf[kp_idx, 1] / scale
@@ -880,7 +843,6 @@ def orientation_kernel(
     if tflat < ORI_BINS:
         hist[tflat] = 0.0
     cuda.syncthreads()
-    # Clamp patch to image bounds as C does (siMin..siMax, sjMin..sjMax)
     siMin = 0 if (y0 - R + 0.5) < 0.0 else int(y0 - R + 0.5)
     sjMin = 0 if (x0 - R + 0.5) < 0.0 else int(x0 - R + 0.5)
     siMax_f = y0 + R + 0.5
