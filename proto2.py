@@ -279,10 +279,10 @@ def oversample_bilinear_kernel(src, dst, delta_min):
 
 @cuda.jit(device=True, inline=True, cache=True, fastmath=True)
 def mirror(i: int, n: int) -> int:
-    ll = n << 1
-    i = (i + ll) % ll
-    if i > n - 1:
-        i = ll - 1 - i
+    if i < 0:
+        i = -i - 1
+    elif i >= n:
+        i = (n << 1) - 1 - i
     return i
 
 
@@ -1023,6 +1023,8 @@ def descriptor_kernel(
     radiusF = LAMBDA_DESC * sigma / scale
     inv_2sig2 = 1.0 / (2.0 * radiusF * radiusF)
     bin_scale = NORIBIN / TWO_PI
+    half_bins = (NHIST - 1.0) * 0.5
+    inv_cell = NHIST / (2.0 * radiusF)
 
     R = (1.0 + 1.0 / NHIST) * radiusF
     Rp = ld.sqrtf(2.0) * R
@@ -1052,9 +1054,8 @@ def descriptor_kernel(
 
             dx = dy0 * c + dx0 * snt
             dy = -dy0 * snt + dx0 * c
-            u = dy / (2.0 * radiusF / NHIST) + (NHIST - 1.0) * 0.5
-            v = dx / (2.0 * radiusF / NHIST) + (NHIST - 1.0) * 0.5
-            R = (1.0 + 1.0 / NHIST) * radiusF
+            u = dy * inv_cell + half_bins
+            v = dx * inv_cell + half_bins
             if not (ld.fabsf(dx) < R and ld.fabsf(dy) < R):
                 continue
             m = mag[s, yy, xx]
@@ -1078,7 +1079,7 @@ def descriptor_kernel(
                         if 0 <= vv < NHIST:
                             wv = (1 - dv) if iv == 0 else dv
                             for io in (0, 1):
-                                oo = (o0 + io) % NORIBIN
+                                oo = (o0 + io) & (NORIBIN - 1)
                                 wo = (1 - do) if io == 0 else do
                                 hidx = ((uu * NHIST + vv) * NORIBIN) + oo
                                 cuda.atomic.add(hist, hidx, wbase * wu * wv * wo)
