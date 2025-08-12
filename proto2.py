@@ -775,70 +775,72 @@ def wrap_angle(theta: numba.float32) -> numba.float32:
     return ld.fmodf(ld.fmodf(theta, TWO_PI) + TWO_PI, TWO_PI)
 
 
-@cuda.jit(cache=True, fastmath=True)
-def gradient_kernel(img, grad_x, grad_y):
-    x, y = cuda.grid(2)
+
+@cuda.jit(cache=True)
+def gradient_kernel(img, mag, ori):
+    tile = cuda.shared.array(shape=0, dtype=numba.float32)
+
+    tx = cuda.threadIdx.x
+    ty = cuda.threadIdx.y
+    bx = cuda.blockIdx.x
+    by = cuda.blockIdx.y
+    bdx = cuda.blockDim.x
+    bdy = cuda.blockDim.y
+
+    x = bx * bdx + tx
+    y = by * bdy + ty
+
     h, w = img.shape
+
+    base_x = bx * bdx
+    base_y = by * bdy
+
+    tile_w = TX + 2
+    tile_h = TY + 2
+    for ly in range(ty, tile_h, bdy):
+        gy = base_y + ly - 1
+        if gy < 0:
+            gy = 0
+        elif gy > h - 1:
+            gy = h - 1
+        for lx in range(tx, tile_w, bdx):
+            gx = base_x + lx - 1
+            if gx < 0:
+                gx = 0
+            elif gx > w - 1:
+                gx = w - 1
+            tile[ly * tile_w + lx] = img[gy, gx]
+
+    cuda.syncthreads()
+
     if x >= w or y >= h:
         return
 
-    if 0 < x < w - 1:
-        gx = numba.float32(0.5) * (img[y, x + 1] - img[y, x - 1])
-    elif x == 0 and w > 1:
-        gx = img[y, 1] - img[y, 0]
-    elif x == w - 1 and w > 1:
-        gx = img[y, w - 1] - img[y, w - 2]
-    else:
-        gx = numba.float32(0.0)
+    ltx = tx + 1
+    lty = ty + 1
 
-    if 0 < y < h - 1:
-        gy = numba.float32(0.5) * (img[y + 1, x] - img[y - 1, x])
-    elif y == 0 and h > 1:
-        gy = img[1, x] - img[0, x]
-    elif y == h - 1 and h > 1:
-        gy = img[h - 1, x] - img[h - 2, x]
-    else:
-        gy = numba.float32(0.0)
+    fx = numba.float32(0.5 if (0 < x < w - 1) else 1.0)
+    fy = numba.float32(0.5 if (0 < y < h - 1) else 1.0)
 
-    grad_x[y, x] = gx
-    grad_y[y, x] = gy
+    base = lty * tile_w + ltx
+    right = tile[base + 1]
+    left = tile[base - 1]
+    down = tile[base + tile_w]
+    up = tile[base - tile_w]
 
-
-@cuda.jit(cache=True, fastmath=True)
-def mag_ori_kernel(img, mag, ori):
-    x, y = cuda.grid(2)
-    h, w = img.shape
-    if x >= w or y >= h:
-        return
-
-    if 0 < x < w - 1:
-        gx = numba.float32(0.5) * (img[y, x + 1] - img[y, x - 1])
-    elif x == 0 and w > 1:
-        gx = img[y, 1] - img[y, 0]
-    elif x == w - 1 and w > 1:
-        gx = img[y, w - 1] - img[y, w - 2]
-    else:
-        gx = numba.float32(0.0)
-
-    if 0 < y < h - 1:
-        gy = numba.float32(0.5) * (img[y + 1, x] - img[y - 1, x])
-    elif y == 0 and h > 1:
-        gy = img[1, x] - img[0, x]
-    elif y == h - 1 and h > 1:
-        gy = img[h - 1, x] - img[h - 2, x]
-    else:
-        gy = numba.float32(0.0)
+    gx = fx * (right - left)
+    gy = fy * (down - up)
 
     m = ld.sqrtf(gx * gx + gy * gy)
-    a = wrap_angle(ld.atan2f(gx, gy))
     mag[y, x] = m
-    ori[y, x] = a
+    ori[y, x] = wrap_angle(ld.atan2f(gx, gy))
 
-
-def compute_mag_ori(img_in, mag_out, ori_out, stream):
-    h, w = img_in.shape
+def compute_mag_ori(img, mag, ori, stream):
+    h, w = img.shape
     grid = ((w + TX - 1) // TX, (h + TY - 1) // TY)
-    mag_ori_kernel[grid, (TX, TY), stream](img_in, mag_out, ori_out)
+    gradient_kernel[grid, (TX, TY), stream, (TX + 2) * (TY + 2) * 4](img, mag, ori)
+
+
 
 
 @cuda.jit(cache=True, fastmath=True)
@@ -918,7 +920,7 @@ def orientation_kernel(
         thr = ORI_THRESHOLD * vmax
         for i in range(ORI_BINS):
             p, c, n = hist[(i - 1) % ORI_BINS], hist[i], hist[(i + 1) % ORI_BINS]
-            if c < thr or c <= p or c <= n:
+            if not (c > thr and c > p and c > n):
                 continue
             denom = p - 2.0 * c + n
             off = (p - n) / (2.0 * denom)
@@ -1231,8 +1233,6 @@ def compute(
     data.keypoints.descriptors.copy_to_host(data.keypoints_host.descriptors, stream)
     data.keypoints.counter.copy_to_host(data.keypoints_host.counter, stream)
     
-    # stream.synchronize()
-
     return snapshots
 
 
@@ -1243,7 +1243,7 @@ class Sift:
         self._cp_stream = cp.cuda.Stream(non_blocking=True)
         self._stream = cuda.external_stream(self._cp_stream.ptr)
 
-    def compute_from_path(self, img_path: str, record: bool = False) -> KeypointsHost:
+    def compute(self, img_path: str, record: bool = False) -> KeypointsHost:
         img = read_gray_bt709(img_path)
         assert img.shape == self.params.img_dims
         compute(self.data, self.params, self._stream, img, record=record)
@@ -1262,5 +1262,5 @@ if __name__ == "__main__":
 
     img_paths = [f"data/oxford_affine/graf/img{i}.png" for i in range(1,7)]
 
-    for res in sift.compute_many(img_paths):
-        print(res.counter)
+    res1 = sift.compute(img_paths[0])
+    res2 = sift.compute(img_paths[1])
