@@ -986,6 +986,6 @@ if __name__ == "__main__":
         raise SystemExit("No images found")
     first = read_image(images[0])
     params = SiftParams(img_dims=first.shape)
-    sift = Sift(params, use_graph=False)
+    sift = Sift(params, use_graph=True)
     for path, kp in zip(images, sift.process_images(images)):
         print(f"{path.name}: {len(kp.positions)} keypoints")
