@@ -35,7 +35,12 @@ W709_BGR = np.array(
 BLUR_TH = 128
 MAX_GAUSS_RADIUS = 16
 GRAD_TILE_SIZE = (TX + 2) * (TY + 2)
-GAUSS_TILE_SIZE = BLUR_TH + 2 * MAX_GAUSS_RADIUS
+
+GAUSS_HORZ_TILE_SIZE = BLUR_TH + 2 * MAX_GAUSS_RADIUS
+GAUSS_COEFF_TILE_SIZE = MAX_GAUSS_RADIUS + 1
+
+GAUSS_VERT_TILE_H = TY + 2 * MAX_GAUSS_RADIUS
+GAUSS_VERT_TILE_SIZE = GAUSS_VERT_TILE_H * TX
 
 
 def read_gray_bt709(path: str) -> np.ndarray:
@@ -293,12 +298,18 @@ def mirror(i: int, n: int) -> int:
 
 @cuda.jit(cache=True, fastmath=True)
 def gauss_h(src, dst, g, radius):
-    tile = cuda.shared.array(shape=GAUSS_TILE_SIZE, dtype=numba.float32)
+    tile = cuda.shared.array(shape=GAUSS_HORZ_TILE_SIZE, dtype=numba.float32)
+    g_sh = cuda.shared.array(shape=GAUSS_COEFF_TILE_SIZE, dtype=numba.float32)
 
     x, y = cuda.grid(2)
     tx = cuda.threadIdx.x
     h, w_in = src.shape
     bs = cuda.blockDim.x
+
+    # Load gaussian coefficients into shared memory once per block
+    for i in range(tx, radius + 1, bs):
+        g_sh[i] = g[i]
+    cuda.syncthreads()
 
     tile_w = bs + 2 * radius
     base_x = cuda.blockIdx.x * bs - radius
@@ -310,41 +321,57 @@ def gauss_h(src, dst, g, radius):
 
     if x < w_in and y < h:
         center = tile[tx + radius]
-        acc = numba.float32(center * g[0])
+        acc = center * g_sh[0]
 
-        for k in range(1, radius + 1):
-            left = tile[tx + radius - k]
-            right = tile[tx + radius + k]
-            acc += numba.float32(g[k] * (left + right))
+        for k in range(1, MAX_GAUSS_RADIUS + 1):
+            if k <= radius:
+                left = tile[tx + radius - k]
+                right = tile[tx + radius + k]
+                acc += g_sh[k] * (left + right)
 
         dst[y, x] = acc
 
 
 @cuda.jit(cache=True, fastmath=True)
 def gauss_v(src, dst, g, radius):
-    tile = cuda.shared.array(shape=GAUSS_TILE_SIZE, dtype=numba.float32)
+    v_tile = cuda.shared.array(shape=GAUSS_VERT_TILE_SIZE, dtype=numba.float32)
+    g_sh = cuda.shared.array(shape=GAUSS_COEFF_TILE_SIZE, dtype=numba.float32)
 
-    x, y = cuda.grid(2)
-    ty = cuda.threadIdx.y
     h_in, w_in = src.shape
-    bs = cuda.blockDim.y
 
-    tile_h = bs + 2 * radius
-    base_y = cuda.blockIdx.y * bs - radius
+    x = cuda.blockIdx.x * cuda.blockDim.x + cuda.threadIdx.x
+    y = cuda.blockIdx.y * cuda.blockDim.y + cuda.threadIdx.y
 
-    for i in range(ty, tile_h, bs):
+    tx = cuda.threadIdx.x
+    ty = cuda.threadIdx.y
+
+    base_x = cuda.blockIdx.x * cuda.blockDim.x
+    base_y = cuda.blockIdx.y * cuda.blockDim.y - radius
+
+    for i in range(tx, radius + 1, cuda.blockDim.x):
+        g_sh[i] = g[i]
+    cuda.syncthreads()
+
+    tile_h = cuda.blockDim.y + 2 * radius
+
+    i = ty
+    while i < tile_h:
         ly = base_y + i
-        tile[i] = src[mirror(ly, h_in), x]
+        src_y = mirror(ly, h_in)
+        src_x = base_x + tx
+        v_tile[i * TX + tx] = src[src_y, mirror(src_x, w_in)]
+        i += cuda.blockDim.y
     cuda.syncthreads()
 
     if x < w_in and y < h_in:
-        center = tile[ty + radius]
-        acc = numba.float32(center * g[0])
+        center = v_tile[(ty + radius) * TX + tx]
+        acc = center * g_sh[0]
 
-        for k in range(1, radius + 1):
-            up = tile[ty + radius - k]
-            down = tile[ty + radius + k]
-            acc += numba.float32(g[k] * (up + down))
+        for k in range(1, MAX_GAUSS_RADIUS + 1):
+            if k <= radius:
+                up = v_tile[(ty + radius - k) * TX + tx]
+                down = v_tile[(ty + radius + k) * TX + tx]
+                acc += g_sh[k] * (up + down)
 
         dst[y, x] = acc
 
@@ -598,8 +625,12 @@ def gaussian_blur(img_in, img_out, scratch, stream, gauss_kernel, radius):
         raise ValueError(
             f"Gaussian radius {radius} exceeds MAX_GAUSS_RADIUS={MAX_GAUSS_RADIUS}."
         )
-    v_grid = (img_in.shape[1], (img_in.shape[0] + th - 1) // th)
-    gauss_v[v_grid, (1, th), stream](img_in, scratch, gauss_kernel, radius)
+    # Vertical pass: 2D blocks for coalesced loads along x
+    v_grid = (
+        (img_in.shape[1] + TX - 1) // TX,
+        (img_in.shape[0] + TY - 1) // TY,
+    )
+    gauss_v[v_grid, (TX, TY), stream](img_in, scratch, gauss_kernel, radius)
     h_grid = ((img_in.shape[1] + th - 1) // th, img_in.shape[0])
     gauss_h[h_grid, (th,), stream](scratch, img_out, gauss_kernel, radius)
 
