@@ -32,6 +32,11 @@ W709_BGR = np.array(
     [0.072192315360734, 0.715168678767756, 0.212639005871510], dtype=np.float32
 )
 
+BLUR_TH = 128
+MAX_GAUSS_RADIUS = 16
+GRAD_TILE_SIZE = (TX + 2) * (TY + 2)
+GAUSS_TILE_SIZE = BLUR_TH + 2 * MAX_GAUSS_RADIUS
+
 
 def read_gray_bt709(path: str) -> np.ndarray:
     im = cv2.imdecode(np.fromfile(path, np.uint8), cv2.IMREAD_COLOR)
@@ -288,7 +293,7 @@ def mirror(i: int, n: int) -> int:
 
 @cuda.jit(cache=True, fastmath=True)
 def gauss_h(src, dst, g, radius):
-    tile = cuda.shared.array(shape=0, dtype=numba.float32)
+    tile = cuda.shared.array(shape=GAUSS_TILE_SIZE, dtype=numba.float32)
 
     x, y = cuda.grid(2)
     tx = cuda.threadIdx.x
@@ -317,7 +322,7 @@ def gauss_h(src, dst, g, radius):
 
 @cuda.jit(cache=True, fastmath=True)
 def gauss_v(src, dst, g, radius):
-    tile = cuda.shared.array(shape=0, dtype=numba.float32)
+    tile = cuda.shared.array(shape=GAUSS_TILE_SIZE, dtype=numba.float32)
 
     x, y = cuda.grid(2)
     ty = cuda.threadIdx.y
@@ -588,15 +593,15 @@ def gaussian_symm_kernel(sigma: float) -> tuple[DeviceNDArray, int]:
 
 
 def gaussian_blur(img_in, img_out, scratch, stream, gauss_kernel, radius):
-    th = 128
+    th = BLUR_TH
+    if radius > MAX_GAUSS_RADIUS:
+        raise ValueError(
+            f"Gaussian radius {radius} exceeds MAX_GAUSS_RADIUS={MAX_GAUSS_RADIUS}."
+        )
     v_grid = (img_in.shape[1], (img_in.shape[0] + th - 1) // th)
-    gauss_v[v_grid, (1, th), stream, (th + 2 * radius) * 4](
-        img_in, scratch, gauss_kernel, radius
-    )
+    gauss_v[v_grid, (1, th), stream](img_in, scratch, gauss_kernel, radius)
     h_grid = ((img_in.shape[1] + th - 1) // th, img_in.shape[0])
-    gauss_h[h_grid, (th,), stream, (th + 2 * radius) * 4](
-        scratch, img_out, gauss_kernel, radius
-    )
+    gauss_h[h_grid, (th,), stream](scratch, img_out, gauss_kernel, radius)
 
 
 def gradient(img_in, gx_out, gy_out, stream):
@@ -778,7 +783,7 @@ def wrap_angle(theta: numba.float32) -> numba.float32:
 
 @cuda.jit(cache=True)
 def gradient_kernel(img, mag, ori):
-    tile = cuda.shared.array(shape=0, dtype=numba.float32)
+    tile = cuda.shared.array(shape=GRAD_TILE_SIZE, dtype=numba.float32)
 
     tx = cuda.threadIdx.x
     ty = cuda.threadIdx.y
@@ -838,7 +843,7 @@ def gradient_kernel(img, mag, ori):
 def compute_mag_ori(img, mag, ori, stream):
     h, w = img.shape
     grid = ((w + TX - 1) // TX, (h + TY - 1) // TY)
-    gradient_kernel[grid, (TX, TY), stream, (TX + 2) * (TY + 2) * 4](img, mag, ori)
+    gradient_kernel[grid, (TX, TY), stream](img, mag, ori)
 
 
 
