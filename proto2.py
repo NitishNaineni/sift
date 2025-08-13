@@ -157,9 +157,7 @@ class KeypointsHost:
     float_buffer: np.ndarray  # y_world, x_world, sigma, orientation
     descriptors: np.ndarray  # 128-dim SIFT descriptor per keypoint (uint8)
     # keypoint count, overflow count
-    counter: np.ndarray = field(
-        default_factory=lambda: np.zeros(3, dtype=np.int32)
-    )
+    counter: np.ndarray = field(default_factory=lambda: np.zeros(3, dtype=np.int32))
 
 
 @dataclass
@@ -205,6 +203,7 @@ def create_keypoints(params: SiftParams) -> Keypoints:
         descriptors=cuda.device_array((n, 128), np.uint8),
     )
 
+
 def create_keypoints_host(params: SiftParams) -> KeypointsHost:
     n = params.max_keypoints
     return KeypointsHost(
@@ -232,7 +231,7 @@ def create_sift_data(params: SiftParams) -> SiftData:
         ori=tuple(ori),
         extrema=create_extrema(params),
         keypoints=create_keypoints(params),
-        keypoints_host = create_keypoints_host(params)
+        keypoints_host=create_keypoints_host(params),
     )
 
 
@@ -772,11 +771,14 @@ def discard_on_edge_kernel(dog_oct, int_buf, ext_count, C_edge, oct_idx):
 
 @cuda.jit(device=True, inline=True, cache=True, fastmath=True)
 def wrap_angle(theta: numba.float32) -> numba.float32:
-    return ld.fmodf(ld.fmodf(theta, TWO_PI) + TWO_PI, TWO_PI)
+    if theta < numba.float32(0.0):
+        theta = theta + TWO_PI
+    elif theta >= TWO_PI:
+        theta = theta - TWO_PI
+    return theta
 
 
-
-@cuda.jit(cache=True)
+@cuda.jit(cache=True, fastmath=True)
 def gradient_kernel(img, mag, ori):
     tile = cuda.shared.array(shape=0, dtype=numba.float32)
 
@@ -797,19 +799,32 @@ def gradient_kernel(img, mag, ori):
 
     tile_w = TX + 2
     tile_h = TY + 2
+    interior = (
+        base_x > 0
+        and (base_x + TX) < (w - 1)
+        and base_y > 0
+        and (base_y + TY) < (h - 1)
+    )
     for ly in range(ty, tile_h, bdy):
         gy = base_y + ly - 1
-        if gy < 0:
-            gy = 0
-        elif gy > h - 1:
-            gy = h - 1
         for lx in range(tx, tile_w, bdx):
             gx = base_x + lx - 1
-            if gx < 0:
-                gx = 0
-            elif gx > w - 1:
-                gx = w - 1
-            tile[ly * tile_w + lx] = img[gy, gx]
+            if not interior:
+                if gy < 0:
+                    gy_eff = 0
+                elif gy > h - 1:
+                    gy_eff = h - 1
+                else:
+                    gy_eff = gy
+                if gx < 0:
+                    gx_eff = 0
+                elif gx > w - 1:
+                    gx_eff = w - 1
+                else:
+                    gx_eff = gx
+                tile[ly * tile_w + lx] = img[gy_eff, gx_eff]
+            else:
+                tile[ly * tile_w + lx] = img[gy, gx]
 
     cuda.syncthreads()
 
@@ -831,16 +846,19 @@ def gradient_kernel(img, mag, ori):
     gx = fx * (right - left)
     gy = fy * (down - up)
 
-    m = ld.sqrtf(gx * gx + gy * gy)
-    mag[y, x] = m
-    ori[y, x] = wrap_angle(ld.atan2f(gx, gy))
+    m2 = gx * gx + gy * gy
+    mag[y, x] = ld.sqrtf(m2)
+    if m2 == numba.float32(0.0):
+        ori[y, x] = numba.float32(0.0)
+    else:
+        theta = ld.atan2f(gx, gy)
+        ori[y, x] = wrap_angle(theta)
+
 
 def compute_mag_ori(img, mag, ori, stream):
     h, w = img.shape
     grid = ((w + TX - 1) // TX, (h + TY - 1) // TY)
     gradient_kernel[grid, (TX, TY), stream, (TX + 2) * (TY + 2) * 4](img, mag, ori)
-
-
 
 
 @cuda.jit(cache=True, fastmath=True)
@@ -1007,9 +1025,7 @@ def discard_near_the_border_kernel(
 
 
 @cuda.jit(cache=True, fastmath=True)
-def descriptor_kernel(
-    mag, ori, key_float, key_int, kctr, desc, oct_idx, delta_min
-):
+def descriptor_kernel(mag, ori, key_float, key_int, kctr, desc, oct_idx, delta_min):
     kp_idx = cuda.blockIdx.x
     if kp_idx < kctr[1] or kp_idx >= kctr[0] or key_int[kp_idx, 0] != oct_idx:
         return
@@ -1172,9 +1188,7 @@ def compute_octave(
     else:
         set_first_scale(data, params, octave_index, stream)
 
-    snapshot["gss"] = compute_gss(
-        data, params, octave_index, stream, record
-    )
+    snapshot["gss"] = compute_gss(data, params, octave_index, stream, record)
     snapshot["dog"] = compute_dog(data, params, octave_index, stream, record)
     snapshot["extrema"] = detect_extrema(data, params, octave_index, stream, record)
     snapshot["contrast_pre"] = discard_with_low_response(
@@ -1228,12 +1242,11 @@ def compute(
         snapshot = compute_octave(data, params, o, stream, record)
         snapshots.append(snapshot)
 
-
     data.keypoints.int_buffer.copy_to_host(data.keypoints_host.int_buffer, stream)
     data.keypoints.float_buffer.copy_to_host(data.keypoints_host.float_buffer, stream)
     data.keypoints.descriptors.copy_to_host(data.keypoints_host.descriptors, stream)
     data.keypoints.counter.copy_to_host(data.keypoints_host.counter, stream)
-    
+
     return snapshots
 
 
@@ -1255,13 +1268,11 @@ class Sift:
             yield self.compute_from_path(p, record=record)
 
 
-
 if __name__ == "__main__":
-
-    params = SiftParams(img_dims = (640, 800))
+    params = SiftParams(img_dims=(640, 800))
     sift = Sift(params)
 
-    img_paths = [f"data/oxford_affine/graf/img{i}.png" for i in range(1,7)]
+    img_paths = [f"data/oxford_affine/graf/img{i}.png" for i in range(1, 7)]
 
     res1 = sift.compute(img_paths[0])
     res2 = sift.compute(img_paths[1])

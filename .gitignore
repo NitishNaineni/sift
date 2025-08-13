@@ -14,3 +14,5 @@ data/
 *.o
 bin/
 __pycache__/
+
+*.ncu-rep
