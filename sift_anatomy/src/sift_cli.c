@@ -116,7 +116,7 @@ void print_usage()
     fprintf(stderr, "                                                                           \n");
     fprintf(stderr, "   --record dir        dump all outputs into a single directory with      \n");
     fprintf(stderr, "                        subfolders: gss, dog, grad_x, grad_y, extrema,     \n");
-    fprintf(stderr, "                        contrast_pre, refined, contrast_post, edge, border\n");
+    fprintf(stderr, "                        c_pre, refined, c_post, edge, border\n");
 }
 
 
@@ -322,17 +322,17 @@ int main(int argc, char **argv)
         nw = snprintf(path, sizeof(path), "%s/%s", dump_all_dir, "extrema");
         if (nw < 0 || (size_t)nw >= sizeof(path)) fatal_error("Path too long for extrema");
         dump_raw_extrema_to_dir(kk[0], path);
-        /* contrast_pre (kB) */
-        nw = snprintf(path, sizeof(path), "%s/%s", dump_all_dir, "contrast_pre");
-        if (nw < 0 || (size_t)nw >= sizeof(path)) fatal_error("Path too long for contrast_pre");
+        /* c_pre (kB) */
+        nw = snprintf(path, sizeof(path), "%s/%s", dump_all_dir, "c_pre");
+        if (nw < 0 || (size_t)nw >= sizeof(path)) fatal_error("Path too long for c_pre");
         dump_raw_extrema_to_dir(kk[1], path);
         /* refined (kC) */
         nw = snprintf(path, sizeof(path), "%s/%s", dump_all_dir, "refined");
         if (nw < 0 || (size_t)nw >= sizeof(path)) fatal_error("Path too long for refined");
         dump_refined_extrema_to_dir(kk[2], path);
-        /* contrast_post (kD) */
-        nw = snprintf(path, sizeof(path), "%s/%s", dump_all_dir, "contrast_post");
-        if (nw < 0 || (size_t)nw >= sizeof(path)) fatal_error("Path too long for contrast_post");
+        /* c_post (kD) */
+        nw = snprintf(path, sizeof(path), "%s/%s", dump_all_dir, "c_post");
+        if (nw < 0 || (size_t)nw >= sizeof(path)) fatal_error("Path too long for c_post");
         dump_raw_extrema_to_dir(kk[3], path);
         /* edge (kE) */
         nw = snprintf(path, sizeof(path), "%s/%s", dump_all_dir, "edge");

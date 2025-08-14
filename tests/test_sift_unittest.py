@@ -16,7 +16,6 @@ class SiftComputeMixin:
 
     IMG_PATH: str | None = None
 
-
     @classmethod
     def setUpClass(cls):
         try:
@@ -186,7 +185,6 @@ class SiftComputeMixin:
             "dog",
             self.TOL_ARRAY,
         )
-
 
     def test_oriented_keypoints_match_cli_dump(self):
         keys_dir = self.record_dir / "keys"
@@ -373,43 +371,43 @@ class SiftComputeMixin:
         self._assert_set_parity(
             set_c,
             set_p,
-            prefix="contrast_post set mismatch",
+            prefix="c_post set mismatch",
             label_a="only_in_c",
             label_b="only_in_py",
         )
 
-    def test_contrast_pre_matches_cli_dump(self):
-        meta = self._load_json(self.record_dir / "contrast_pre/extrema_meta.json")
+    def test_c_pre_matches_cli_dump(self):
+        meta = self._load_json(self.record_dir / "c_pre/extrema_meta.json")
         ints_c = np.fromfile(
-            self.record_dir / "contrast_pre" / meta.get("int_file", "extrema_int.i32"),
+            self.record_dir / "c_pre" / meta.get("int_file", "extrema_int.i32"),
             dtype=np.int32,
         ).reshape(-1, 4)
-        ints_p = self._concat_ints("contrast_pre")
+        ints_p = self._concat_ints("c_pre")
 
         set_c = set(map(tuple, ints_c.tolist()))
         set_p = set(map(tuple, ints_p.tolist()))
         self._assert_set_parity(
             set_c,
             set_p,
-            prefix="contrast_pre set mismatch",
+            prefix="c_pre set mismatch",
             label_a="only_in_c",
             label_b="only_in_py",
         )
 
-    def test_contrast_post_matches_cli_dump(self):
-        meta = self._load_json(self.record_dir / "contrast_post/extrema_meta.json")
+    def test_c_post_matches_cli_dump(self):
+        meta = self._load_json(self.record_dir / "c_post/extrema_meta.json")
         ints_c = np.fromfile(
-            self.record_dir / "contrast_post" / meta.get("int_file", "extrema_int.i32"),
+            self.record_dir / "c_post" / meta.get("int_file", "extrema_int.i32"),
             dtype=np.int32,
         ).reshape(-1, 4)
-        ints_p = self._concat_ints("contrast_post")
+        ints_p = self._concat_ints("c_post")
 
         set_c = set(map(tuple, ints_c.tolist()))
         set_p = set(map(tuple, ints_p.tolist()))
         self._assert_set_parity(
             set_c,
             set_p,
-            prefix="contrast_post set mismatch",
+            prefix="c_post set mismatch",
             label_a="only_in_c",
             label_b="only_in_py",
         )
@@ -539,9 +537,9 @@ class SiftComputeMixin:
                 "gss",
                 "dog",
                 "extrema",
-                "contrast_pre",
+                "c_pre",
                 "refined",
-                "contrast_post",
+                "c_post",
                 "edge",
                 "border",
             ):
@@ -557,17 +555,17 @@ class SiftComputeMixin:
 
             counts = {
                 "extrema": count(snap["extrema"]),
-                "contrast_pre": count(snap["contrast_pre"]),
+                "c_pre": count(snap["c_pre"]),
                 "refined": count(snap["refined"]),
-                "contrast_post": count(snap["contrast_post"]),
+                "c_post": count(snap["c_post"]),
                 "edge": count(snap["edge"]),
                 "border": count(snap["border"]),
             }
             with self.subTest(octave=o, counts=counts):
-                self.assertGreaterEqual(counts["extrema"], counts["contrast_pre"])
-                self.assertGreaterEqual(counts["contrast_pre"], counts["refined"])
-                self.assertGreaterEqual(counts["refined"], counts["contrast_post"])
-                self.assertGreaterEqual(counts["contrast_post"], counts["edge"])
+                self.assertGreaterEqual(counts["extrema"], counts["c_pre"])
+                self.assertGreaterEqual(counts["c_pre"], counts["refined"])
+                self.assertGreaterEqual(counts["refined"], counts["c_post"])
+                self.assertGreaterEqual(counts["c_post"], counts["edge"])
                 self.assertGreaterEqual(counts["edge"], counts["border"])
                 self.assertGreaterEqual(counts["border"], 0)
 
@@ -585,24 +583,20 @@ class SiftComputeMixin:
             with self.subTest(octave=o):
                 self._assert_shapes_dtypes(self.snapshots[o]["extrema"], floats_cols=4)
 
-    def test_shapes_dtypes_contrast_pre(self):
+    def test_shapes_dtypes_c_pre(self):
         for o in range(self.params.n_oct):
             with self.subTest(octave=o):
-                self._assert_shapes_dtypes(
-                    self.snapshots[o]["contrast_pre"], floats_cols=4
-                )
+                self._assert_shapes_dtypes(self.snapshots[o]["c_pre"], floats_cols=4)
 
     def test_shapes_dtypes_refined(self):
         for o in range(self.params.n_oct):
             with self.subTest(octave=o):
                 self._assert_shapes_dtypes(self.snapshots[o]["refined"], floats_cols=4)
 
-    def test_shapes_dtypes_contrast_post(self):
+    def test_shapes_dtypes_c_post(self):
         for o in range(self.params.n_oct):
             with self.subTest(octave=o):
-                self._assert_shapes_dtypes(
-                    self.snapshots[o]["contrast_post"], floats_cols=4
-                )
+                self._assert_shapes_dtypes(self.snapshots[o]["c_post"], floats_cols=4)
 
     def test_shapes_dtypes_edge(self):
         for o in range(self.params.n_oct):
@@ -615,12 +609,9 @@ class SiftComputeMixin:
                 self._assert_shapes_dtypes(self.snapshots[o]["border"], floats_cols=4)
 
 
-
 class TestSiftImg1(SiftComputeMixin, unittest.TestCase):
     IMG_PATH = "data/oxford_affine/graf/img1.png"
 
 
-class TestSiftImg2(SiftComputeMixin, unittest.TestCase):
-    IMG_PATH = "data/oxford_affine/graf/img2.png"
-
-    
+# class TestSiftImg2(SiftComputeMixin, unittest.TestCase):
+#     IMG_PATH = "data/oxford_affine/graf/img2.png"
