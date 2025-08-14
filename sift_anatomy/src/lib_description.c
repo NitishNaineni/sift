@@ -388,6 +388,32 @@ void sift_threshold_and_quantize_feature_vector(float* descr, int n, float thres
     }
 }
 
+void sift_rootsift_quantize_feature_vector(float* descr, int n)
+{
+    // L1-normalize
+    double sum_abs = 0.0;
+    for (int i = 0; i < n; i++) {
+        float v = descr[i];
+        if (v > 0.0f) sum_abs += (double)v; // descriptors are non-negative by construction
+    }
+    float inv_l1 = (sum_abs > 0.0) ? (float)(1.0 / sum_abs) : 0.0f;
+    for (int i = 0; i < n; i++) {
+        descr[i] = descr[i] * inv_l1;
+    }
+    // Element-wise sqrt (Hellinger)
+    for (int i = 0; i < n; i++) {
+        float v = descr[i];
+        descr[i] = v > 0.0f ? sqrtf(v) : 0.0f;
+    }
+    // Quantize to [0,255] with scale 255 to preserve RootSIFT dynamic range
+    for (int i = 0; i < n; i++) {
+        int q = (int)(descr[i] * 255.0f + 0.5f);
+        if (q > 255) q = 255;
+        if (q < 0) q = 0;
+        descr[i] = (float)q;
+    }
+}
+
 
 
 

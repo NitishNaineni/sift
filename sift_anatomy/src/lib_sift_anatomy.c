@@ -759,8 +759,8 @@ static void keypoints_attribute_descriptors(struct sift_scalespace *sx,
                                     n_hist, n_ori, lambda_descr,
                                     key->descr);
 
-        /** Threshold and quantization of the descriptor */
-        sift_threshold_and_quantize_feature_vector(key->descr, n_descr, 0.2);
+        /** RootSIFT quantization of the descriptor */
+        sift_rootsift_quantize_feature_vector(key->descr, n_descr);
     }
 }
 

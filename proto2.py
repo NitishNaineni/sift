@@ -764,23 +764,20 @@ def smooth_orientation_hist(hist):
 
 
 @cuda.jit(device=True, inline=True, cache=True, fastmath=True)
-def normalize_clip_renorm_descriptor(hist):
-    l2 = 0.0
+def normalize_rootsift(hist):
+    # L1 normalize
+    s = 0.0
     for i in range(DESC_LEN):
-        l2 += hist[i] * hist[i]
-    norm = ld.sqrtf(l2) + 1e-12
-    inv = 1.0 / norm
-
-    l2p = 0.0
+        v = hist[i]
+        if v > 0.0:
+            s += v
+    inv = 1.0 / (s + 1e-12)
     for i in range(DESC_LEN):
-        v = hist[i] * inv
-        v = 0.2 if v > 0.2 else v
-        hist[i] = v
-        l2p += v * v
-    norm2 = ld.sqrtf(l2p) + 1e-12
-    inv2 = 1.0 / norm2
+        hist[i] = hist[i] * inv
+    # element-wise sqrt (Hellinger)
     for i in range(DESC_LEN):
-        hist[i] = hist[i] * inv2
+        v = hist[i]
+        hist[i] = ld.sqrtf(v) if v > 0.0 else 0.0
 
 
 @cuda.jit(device=True, inline=True, cache=True, fastmath=True)
@@ -1044,9 +1041,9 @@ def descriptor_kernel(mag, ori, key_float, key_int, kctr, desc, oct_idx, delta_m
             ob = a * bin_scale
             wbase = m * gaussian_weight(dx, dy, inv_2sig2)
             trilinear_accumulate(hist, u, v, ob, wbase)
-    normalize_clip_renorm_descriptor(hist)
+    normalize_rootsift(hist)
     for i in range(DESC_LEN):
-        q = hist[i] * 512.0
+        q = hist[i] * 255.0 + 0.5
         desc[kp_idx, i] = 255 if q > 255 else int(q)
 
 
