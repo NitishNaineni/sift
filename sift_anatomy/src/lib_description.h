@@ -99,4 +99,7 @@ void sift_extract_feature_vector(float x_key,
 
 void sift_threshold_and_quantize_feature_vector(float* descr, int n, float threshold);
 
+// RootSIFT: L1-normalize, element-wise sqrt, then quantize to [0,255]
+void sift_rootsift_quantize_feature_vector(float* descr, int n);
+
 #endif // _LIB_DESCRIPTION_H_

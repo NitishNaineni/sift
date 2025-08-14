@@ -540,7 +540,7 @@ static void dump_oriented_keypoints_to_dir(const struct sift_keypoints* keys, co
                     float vv = key->descr ? key->descr[src] : 0.0f;
                     if (vv < 0.0f) vv = 0.0f;
                     if (vv > 255.0f) vv = 255.0f;
-                    buf_d[(size_t)k * (size_t)nd + (size_t)dst] = (unsigned char)(vv + 0.5f);
+                    buf_d[(size_t)k * (size_t)nd + (size_t)dst] = (unsigned char)(vv);
                 }
             }
         }
