@@ -1,19 +1,19 @@
 from __future__ import annotations
-from pathlib import Path
+
+import math
+import os
+import warnings
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Iterable
-import numpy as np
+from typing import Dict, Iterable, Optional
+
+import cupy as cp
 import cv2
 import numba
+import numpy as np
 from numba import cuda
+from numba.core.errors import NumbaPerformanceWarning
 from numba.cuda import libdevice as ld
 from numba.cuda.cudadrv.devicearray import DeviceNDArray
-import math
-import warnings
-from numba.core.errors import NumbaPerformanceWarning
-import os
-import cupy as cp
-
 
 os.environ["NUMBA_CUDA_ARRAY_INTERFACE_SYNC"] = "0"
 
@@ -51,14 +51,15 @@ def read_gray_bt709(path: str) -> np.ndarray:
 @dataclass
 class SiftParams:
     img_dims: tuple[int, int]
+    depth_dims: tuple[int, int]
     n_oct: int = -1
     n_spo: int = 3
     sigma_in: float = 0.5
     delta_min: float = 0.5
     sigma_min: float = 0.8
 
-    max_extrema: int = 10_000
-    max_keypoints: int = 10_000
+    max_extrema: int = 100_000
+    max_keypoints: int = 100_000
 
     C_dog: float = 0.013333333
     C_edge: float = 10.0
@@ -167,20 +168,28 @@ class KeypointsHost:
     float_buffer: np.ndarray  # y_world, x_world, sigma, orientation
     descriptors: np.ndarray  # 128-dim SIFT descriptor per keypoint (uint8)
     # keypoint count, overflow count
-    counter: np.ndarray = field(
-        default_factory=lambda: np.zeros(3, dtype=np.int32)
-    )
+    counter: np.ndarray = field(default_factory=lambda: np.zeros(3, dtype=np.int32))
+
+    def copy(self) -> "KeypointsHost":
+        return KeypointsHost(
+            int_buffer=self.int_buffer.copy(),
+            float_buffer=self.float_buffer.copy(),
+            descriptors=self.descriptors.copy(),
+            counter=self.counter.copy(),
+        )
 
 
 @dataclass
 class SiftData:
     input_img: DeviceNDArray
+    input_depth: DeviceNDArray
     seed_img: DeviceNDArray
     scratch: tuple[DeviceNDArray, ...]
     gss: tuple[DeviceNDArray, ...]
     dog: tuple[DeviceNDArray, ...]
-    mag: tuple[DeviceNDArray, ...]
-    ori: tuple[DeviceNDArray, ...]
+    gx: tuple[DeviceNDArray, ...]
+    gy: tuple[DeviceNDArray, ...]
+    depth: tuple[DeviceNDArray, ...]
     extrema: Extrema
     keypoints: Keypoints
     keypoints_host: KeypointsHost
@@ -194,10 +203,11 @@ def _alloc_octave_tensors(params: SiftParams, octave_index: int):
     gss = cuda.device_array((num_gss_scales, height, width), np.float32)
     dog = cuda.device_array((num_dog_scales, height, width), np.float32)
     scratch = cuda.device_array((height, width), np.float32)
-    mag = cuda.device_array((num_gss_scales, height, width), np.float32)
-    ori = cuda.device_array((num_gss_scales, height, width), np.float32)
+    gx = cuda.device_array((num_gss_scales, height, width), np.float32)
+    gy = cuda.device_array((num_gss_scales, height, width), np.float32)
+    depth = cuda.device_array((height, width), np.float32)
 
-    return gss, dog, scratch, mag, ori
+    return gss, dog, scratch, gx, gy, depth
 
 
 def create_extrema(params: SiftParams) -> Extrema:
@@ -215,6 +225,7 @@ def create_keypoints(params: SiftParams) -> Keypoints:
         descriptors=cuda.device_array((n, 128), np.uint8),
     )
 
+
 def create_keypoints_host(params: SiftParams) -> KeypointsHost:
     n = params.max_keypoints
     return KeypointsHost(
@@ -225,7 +236,7 @@ def create_keypoints_host(params: SiftParams) -> KeypointsHost:
 
 
 def create_sift_data(params: SiftParams) -> SiftData:
-    gss, dog, scratch, mag, ori = zip(
+    gss, dog, scratch, gx, gy, depth = zip(
         *(
             _alloc_octave_tensors(params, octave_index)
             for octave_index in range(params.n_oct)
@@ -234,15 +245,17 @@ def create_sift_data(params: SiftParams) -> SiftData:
     h0, w0 = params.gss_shapes[0]
     return SiftData(
         input_img=cuda.device_array(params.img_dims, np.float32),
+        input_depth=cuda.device_array(params.depth_dims, np.float32),
         seed_img=cuda.device_array((h0, w0), np.float32),
         scratch=tuple(scratch),
         gss=tuple(gss),
         dog=tuple(dog),
-        mag=tuple(mag),
-        ori=tuple(ori),
+        gx=tuple(gx),
+        gy=tuple(gy),
+        depth=tuple(depth),
         extrema=create_extrema(params),
         keypoints=create_keypoints(params),
-        keypoints_host = create_keypoints_host(params)
+        keypoints_host=create_keypoints_host(params),
     )
 
 
@@ -584,11 +597,11 @@ def discard_with_low_response_kernel(int_buf, float_buf, ext_count, thresh, oct_
 def upscale(src, dst, delta_min, stream):
     assert delta_min <= 1.0
     hi, wi = src.shape
-    ho = int(math.floor(hi / delta_min))
-    wo = int(math.floor(wi / delta_min))
+    ho = int(round(hi / float(delta_min)))
+    wo = int(round(wi / float(delta_min)))
     if dst.shape != (ho, wo):
         raise ValueError(
-            f"dst.shape must be {(ho, wo)} for delta_min={delta_min}, got {dst.shape}"
+            f"dst.shape must be {(ho, wo)} for delta_min={float(delta_min)}, got {dst.shape}"
         )
 
     grid = ((wo + TX - 1) // TX, (ho + TY - 1) // TY)
@@ -649,11 +662,11 @@ def compute_gss(
     record: bool = False,
 ):
     gss = data.gss[octave_index]
-    mag = data.mag[octave_index]
-    ori = data.ori[octave_index]
+    gx = data.gx[octave_index]
+    gy = data.gy[octave_index]
     scratch = data.scratch[octave_index]
     num_scales_total = params.n_spo + 3
-    compute_mag_ori(gss[0], mag[0], ori[0], stream)
+    gradient(gss[0], gx[0], gy[0], stream)
     for scale_index in range(1, num_scales_total):
         sigma = params.inc_sigmas[octave_index, scale_index]
         gauss_kernel, radius = params.gauss_kernels[sigma]
@@ -665,9 +678,47 @@ def compute_gss(
             gauss_kernel,
             radius,
         )
-        compute_mag_ori(gss[scale_index], mag[scale_index], ori[scale_index], stream)
+
+        gradient(gss[scale_index], gx[scale_index], gy[scale_index], stream)
     if record:
-        return gss.copy_to_host(stream=stream)
+        return (
+            gss.copy_to_host(stream=stream),
+            gx.copy_to_host(stream=stream),
+            gy.copy_to_host(stream=stream),
+        )
+    return None, None, None
+
+
+def compute_depth(
+    data: SiftData,
+    params: SiftParams,
+    octave_index: int,
+    stream,
+    record: bool = False,
+):
+    if octave_index == 0:
+        in_h, in_w = data.input_depth.shape
+        out_h, out_w = data.depth[0].shape
+        delta_h = float(in_h) / float(out_h)
+        delta_w = float(in_w) / float(out_w)
+        if not (abs(delta_h - delta_w) <= 1e-6):
+            raise ValueError(
+                f"Depth upsample ratios mismatch (h: {delta_h}, w: {delta_w});"
+                f" cannot upscale input depth of shape {(in_h, in_w)} to {(out_h, out_w)}"
+            )
+        upscale(data.input_depth, data.depth[0], float(delta_h), stream)
+        if record:
+            return data.depth[0].copy_to_host(stream=stream)
+        return None
+
+    src = data.depth[octave_index - 1]
+    dst = data.depth[octave_index]
+    height, width = params.gss_shapes[octave_index]
+    grid = ((width + TX - 1) // TX, (height + TY - 1) // TY)
+    downsample_kernel[grid, (TX, TY), stream](src, dst)
+
+    if record:
+        return dst.copy_to_host(stream=stream)
     return None
 
 
@@ -811,9 +862,8 @@ def wrap_angle(theta: numba.float32) -> numba.float32:
     return ld.fmodf(ld.fmodf(theta, TWO_PI) + TWO_PI, TWO_PI)
 
 
-
 @cuda.jit(cache=True)
-def gradient_kernel(img, mag, ori):
+def gradient_kernel(img, gx_out, gy_out):
     tile = cuda.shared.array(shape=GRAD_TILE_SIZE, dtype=numba.float32)
 
     tx = cuda.threadIdx.x
@@ -866,23 +916,14 @@ def gradient_kernel(img, mag, ori):
 
     gx = fx * (right - left)
     gy = fy * (down - up)
-
-    m = ld.sqrtf(gx * gx + gy * gy)
-    mag[y, x] = m
-    ori[y, x] = wrap_angle(ld.atan2f(gx, gy))
-
-def compute_mag_ori(img, mag, ori, stream):
-    h, w = img.shape
-    grid = ((w + TX - 1) // TX, (h + TY - 1) // TY)
-    gradient_kernel[grid, (TX, TY), stream](img, mag, ori)
-
-
+    gx_out[y, x] = gx
+    gy_out[y, x] = gy
 
 
 @cuda.jit(cache=True, fastmath=True)
 def orientation_kernel(
-    mag,
-    ori,
+    gx,
+    gy,
     int_buf,
     float_buf,
     n_extrema,
@@ -905,7 +946,7 @@ def orientation_kernel(
     R = 3.0 * lambda_ori * sigma_oct
     radius = int(R + 0.5)
     radius = 1 if radius == 0 else radius
-    h, w = mag.shape[1:]
+    h, w = gx.shape[1:]
     g_sigma = lambda_ori * sigma_oct
     inv_2sig2 = 1.0 / (2.0 * g_sigma * g_sigma)
     bin_scale = numba.float32(ORI_BINS / TWO_PI)
@@ -928,10 +969,12 @@ def orientation_kernel(
         for dx in range(cuda.threadIdx.x, width, TX):
             xx = sjMin + dx
             dxf = numba.float32(xx) - numba.float32(x0)
-            m = mag[s, yy, xx]
+            gxv = gx[s, yy, xx]
+            gyv = gy[s, yy, xx]
+            m = ld.sqrtf(gxv * gxv + gyv * gyv)
             if m == 0.0:
                 continue
-            a = ori[s, yy, xx]
+            a = wrap_angle(ld.atan2f(gxv, gyv))
             wgt = m * ld.expf(-(dxf * dxf + dyf * dyf) * inv_2sig2)
             bin_f = a * bin_scale + numba.float32(0.5)
             bin_i = int(ld.floorf(bin_f)) % ORI_BINS
@@ -1043,9 +1086,7 @@ def discard_near_the_border_kernel(
 
 
 @cuda.jit(cache=True, fastmath=True)
-def descriptor_kernel(
-    mag, ori, key_float, key_int, kctr, desc, oct_idx, delta_min
-):
+def descriptor_kernel(gx, gy, key_float, key_int, kctr, desc, oct_idx, delta_min):
     kp_idx = cuda.blockIdx.x
     if kp_idx < kctr[1] or kp_idx >= kctr[0] or key_int[kp_idx, 0] != oct_idx:
         return
@@ -1065,7 +1106,7 @@ def descriptor_kernel(
     R = (1.0 + 1.0 / NHIST) * radiusF
     Rp = ld.sqrtf(2.0) * R
 
-    h, w = mag.shape[1:]
+    h, w = gx.shape[1:]
     siMin = 0 if (y0 - Rp + 0.5) < 0.0 else int(y0 - Rp + 0.5)
     sjMin = 0 if (x0 - Rp + 0.5) < 0.0 else int(x0 - Rp + 0.5)
     siMax_f = y0 + Rp + 0.5
@@ -1094,10 +1135,12 @@ def descriptor_kernel(
             v = dx * inv_cell + half_bins
             if not (ld.fabsf(dx) < R and ld.fabsf(dy) < R):
                 continue
-            m = mag[s, yy, xx]
+            gxv = gx[s, yy, xx]
+            gyv = gy[s, yy, xx]
+            m = ld.sqrtf(gxv * gxv + gyv * gyv)
             if m == 0.0:
                 continue
-            a = wrap_angle(ori[s, yy, xx] - theta0)
+            a = wrap_angle(ld.atan2f(gxv, gyv) - theta0)
             ob = a * bin_scale
             u0 = int(ld.floorf(u))
             du = u - u0
@@ -1153,8 +1196,8 @@ def build_descriptors(
     set_kp_start_from_count[1, 1, stream](data.keypoints.counter)
 
     orientation_kernel[(params.max_extrema,), (TX, TY), stream](
-        data.mag[octave_index],
-        data.ori[octave_index],
+        data.gx[octave_index],
+        data.gy[octave_index],
         data.extrema.int_buffer,
         data.extrema.float_buffer,
         data.extrema.counter,
@@ -1167,8 +1210,8 @@ def build_descriptors(
     )
 
     descriptor_kernel[(params.max_keypoints,), (TX, TY), stream](
-        data.mag[octave_index],
-        data.ori[octave_index],
+        data.gx[octave_index],
+        data.gy[octave_index],
         data.keypoints.float_buffer,
         data.keypoints.int_buffer,
         data.keypoints.counter,
@@ -1208,9 +1251,10 @@ def compute_octave(
     else:
         set_first_scale(data, params, octave_index, stream)
 
-    snapshot["gss"] = compute_gss(
+    snapshot["gss"], snapshot["grad_x"], snapshot["grad_y"] = compute_gss(
         data, params, octave_index, stream, record
     )
+    snapshot["depth"] = compute_depth(data, params, octave_index, stream, record)
     snapshot["dog"] = compute_dog(data, params, octave_index, stream, record)
     snapshot["extrema"] = detect_extrema(data, params, octave_index, stream, record)
     snapshot["contrast_pre"] = discard_with_low_response(
@@ -1252,11 +1296,17 @@ def set_first_scale(data: SiftData, params: SiftParams, octave_index: int, strea
 
 
 def compute(
-    data: SiftData, params: SiftParams, stream, img, record: bool = False
+    data: SiftData,
+    params: SiftParams,
+    stream,
+    img,
+    depth,
+    record: bool = False,
 ) -> list[dict[str, object]]:
     snapshots: list[dict[str, object]] = []
 
     data.input_img.copy_to_device(img.astype(np.float32), stream)
+    data.input_depth.copy_to_device(depth.astype(np.float32), stream)
     data.extrema.counter.copy_to_device(np.array([0, 0], dtype=np.int32), stream)
     data.keypoints.counter.copy_to_device(np.array([0, 0, 0], dtype=np.int32), stream)
 
@@ -1264,12 +1314,11 @@ def compute(
         snapshot = compute_octave(data, params, o, stream, record)
         snapshots.append(snapshot)
 
-
     data.keypoints.int_buffer.copy_to_host(data.keypoints_host.int_buffer, stream)
     data.keypoints.float_buffer.copy_to_host(data.keypoints_host.float_buffer, stream)
     data.keypoints.descriptors.copy_to_host(data.keypoints_host.descriptors, stream)
     data.keypoints.counter.copy_to_host(data.keypoints_host.counter, stream)
-    
+
     return snapshots
 
 
@@ -1280,24 +1329,34 @@ class Sift:
         self._cp_stream = cp.cuda.Stream(non_blocking=True)
         self._stream = cuda.external_stream(self._cp_stream.ptr)
 
-    def compute(self, img_path: str, record: bool = False) -> KeypointsHost:
+    def compute(
+        self, img_path: str, depth_path: str, record: bool = False
+    ) -> KeypointsHost:
         img = read_gray_bt709(img_path)
-        assert img.shape == self.params.img_dims
-        compute(self.data, self.params, self._stream, img, record=record)
-        return self.data.keypoints_host
+        depth = np.load(depth_path)
+        assert img.shape == self.params.img_dims, (
+            f"got {img.shape}, expected {self.params.img_dims}"
+        )
+        assert depth.shape == self.params.depth_dims, (
+            f"got depth {depth.shape}, expected {self.params.depth_dims}"
+        )
+        snapshot = compute(
+            self.data, self.params, self._stream, img, depth, record=record
+        )
+        return self.data.keypoints_host.copy(), snapshot
 
     def compute_many(self, img_paths: Iterable[str], record: bool = False):
         for p in img_paths:
             yield self.compute_from_path(p, record=record)
 
 
-
 if __name__ == "__main__":
-
-    params = SiftParams(img_dims = (640, 800))
+    params = SiftParams(img_dims=(1440, 1920), depth_dims=(192, 256))
     sift = Sift(params)
 
-    img_paths = [f"data/oxford_affine/graf/img{i}.png" for i in range(1,7)]
+    m = np.load("data/sidewalk/intrinsics.npy")[37]
+    K = [m[0, 0], m[1, 1], m[0, 2], m[1, 2]]
 
-    res1 = sift.compute(img_paths[0])
-    res2 = sift.compute(img_paths[1])
+    res1, snapshot1 = sift.compute("data/sidewalk/img1.png", "data/sidewalk/depth1.npy")
+
+    print(res1.counter)

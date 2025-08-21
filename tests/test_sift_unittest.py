@@ -45,12 +45,15 @@ class SiftComputeMixin:
         )
 
         img = read_gray_bt709(str(cls.img_path))
-        cls.params = SiftParams(img.shape)
+        # Provide both image and depth dimensions (use the image shape for depth)
+        cls.params = SiftParams(img_dims=img.shape, depth_dims=img.shape)
         cls.data = create_sift_data(cls.params)
         from numba import cuda
 
         stream = cuda.stream()
-        cls.snapshots = compute(cls.data, cls.params, stream, img, record=True)
+        # Create a dummy depth map compatible with params.depth_dims
+        depth = np.ones_like(img, dtype=np.float32)
+        cls.snapshots = compute(cls.data, cls.params, stream, img, depth, record=True)
 
         # Use the image filename stem to name the artifact directory
         img_stem = cls.img_path.stem
@@ -184,6 +187,22 @@ class SiftComputeMixin:
             self.record_dir / "dog/dog_meta.json",
             self.record_dir / "dog",
             "dog",
+            self.TOL_ARRAY,
+        )
+
+    def test_grad_x_matches_cli_dump(self):
+        self._assert_octave_layer_mats_equal(
+            self.record_dir / "grad_x/grad_x_meta.json",
+            self.record_dir / "grad_x",
+            "grad_x",
+            self.TOL_ARRAY,
+        )
+
+    def test_grad_y_matches_cli_dump(self):
+        self._assert_octave_layer_mats_equal(
+            self.record_dir / "grad_y/grad_y_meta.json",
+            self.record_dir / "grad_y",
+            "grad_y",
             self.TOL_ARRAY,
         )
 
