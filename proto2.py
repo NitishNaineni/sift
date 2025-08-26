@@ -408,6 +408,15 @@ def downsample_kernel(src, dst):
 
 
 @cuda.jit(cache=True, fastmath=True)
+def reciprocal_inplace_kernel(arr, eps):
+    y, x = cuda.grid(2)
+    h, w = arr.shape
+    if x < w and y < h:
+        v = arr[y, x]
+        arr[y, x] = numba.float32(1.0) / v if ld.fabsf(v) > eps else numba.float32(0.0)
+
+
+@cuda.jit(cache=True, fastmath=True)
 def dog_diff_kernel(gss_in, dog_out):
     s = cuda.blockIdx.z * cuda.blockDim.z + cuda.threadIdx.z
     y = cuda.blockIdx.y * cuda.blockDim.y + cuda.threadIdx.y
@@ -854,7 +863,24 @@ def compute_depth(
                 f"Depth upsample ratios mismatch (h: {delta_h}, w: {delta_w});"
                 f" cannot upscale input depth of shape {(in_h, in_w)} to {(out_h, out_w)}"
             )
+        # Disparity-based upsampling for better linearity
+        threads = (TX, TY)
+        grid_in = ((in_w + TX - 1) // TX, (in_h + TY - 1) // TY)
+        reciprocal_inplace_kernel[grid_in, threads, stream](
+            data.input_depth, numba.float32(1e-12)
+        )
+
         upscale(data.input_depth, data.depth[0], float(delta_h), stream)
+
+        grid_out = ((out_w + TX - 1) // TX, (out_h + TY - 1) // TY)
+        reciprocal_inplace_kernel[grid_out, threads, stream](
+            data.depth[0], numba.float32(1e-12)
+        )
+
+        # Restore input buffer to original depth values
+        reciprocal_inplace_kernel[grid_in, threads, stream](
+            data.input_depth, numba.float32(1e-12)
+        )
         if record:
             return data.depth[0].copy_to_host(stream=stream)
         return None
@@ -1762,7 +1788,7 @@ if __name__ == "__main__":
     params = SiftParams(img_dims=(1440, 1920), depth_dims=(192, 256))
     sift = Sift(params)
 
-    idx1 = 0
+    idx1 = 37
     K1 = np.load("data/sidewalk/intrinsics.npy")[idx1]
     img1 = read_gray_bt709(f"data/sidewalk/images/{idx1}.png")
     depth1 = np.load(f"data/sidewalk/depths/{idx1}.npy")
