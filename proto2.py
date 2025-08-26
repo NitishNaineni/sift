@@ -4,7 +4,7 @@ import math
 import os
 import warnings
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, Optional
+from typing import Dict, Optional
 
 import cupy as cp
 import cv2
@@ -65,6 +65,9 @@ class SiftParams:
     C_edge: float = 10.0
 
     lambda_ori: float = 1.5
+
+    min_aspect: float = 0.1
+    max_depth: float = 10.0
 
     sigmas: np.ndarray | None = None
     gss_shapes: np.ndarray | None = None
@@ -156,6 +159,7 @@ class Keypoints:
     int_buffer: DeviceNDArray  # o, s, y_int, x_int
     float_buffer: DeviceNDArray  # y_world, x_world, sigma, orientation
     descriptors: DeviceNDArray  # 128-dim SIFT descriptor per keypoint (uint8)
+    tilt_map: DeviceNDArray  # <- NEW
     # keypoint count, overflow count
     counter: DeviceNDArray = field(
         default_factory=lambda: cuda.to_device(np.zeros(3, dtype=np.int32))
@@ -167,6 +171,7 @@ class KeypointsHost:
     int_buffer: np.ndarray  # o, s, y_int, x_int
     float_buffer: np.ndarray  # y_world, x_world, sigma, orientation
     descriptors: np.ndarray  # 128-dim SIFT descriptor per keypoint (uint8)
+    tilt_map: np.ndarray
     # keypoint count, overflow count
     counter: np.ndarray = field(default_factory=lambda: np.zeros(3, dtype=np.int32))
 
@@ -175,6 +180,7 @@ class KeypointsHost:
             int_buffer=self.int_buffer.copy(),
             float_buffer=self.float_buffer.copy(),
             descriptors=self.descriptors.copy(),
+            tilt_map=self.tilt_map.copy(),
             counter=self.counter.copy(),
         )
 
@@ -193,6 +199,7 @@ class SiftData:
     extrema: Extrema
     keypoints: Keypoints
     keypoints_host: KeypointsHost
+    tilt_map: DeviceNDArray
 
 
 def _alloc_octave_tensors(params: SiftParams, octave_index: int):
@@ -223,6 +230,7 @@ def create_keypoints(params: SiftParams) -> Keypoints:
         int_buffer=cuda.device_array((n, 4), np.int32),
         float_buffer=cuda.device_array((n, 4), np.float32),
         descriptors=cuda.device_array((n, 128), np.uint8),
+        tilt_map=cuda.device_array((n, 2, 2), np.float32),
     )
 
 
@@ -232,6 +240,7 @@ def create_keypoints_host(params: SiftParams) -> KeypointsHost:
         int_buffer=np.empty((n, 4), dtype=np.int32),
         float_buffer=np.empty((n, 4), dtype=np.float32),
         descriptors=np.empty((n, 128), dtype=np.uint8),
+        tilt_map=np.empty((n, 2, 2), dtype=np.float32),
     )
 
 
@@ -256,6 +265,7 @@ def create_sift_data(params: SiftParams) -> SiftData:
         extrema=create_extrema(params),
         keypoints=create_keypoints(params),
         keypoints_host=create_keypoints_host(params),
+        tilt_map=cuda.device_array((params.max_extrema, 2, 2), np.float32),
     )
 
 
@@ -594,6 +604,144 @@ def discard_with_low_response_kernel(int_buf, float_buf, ext_count, thresh, oct_
         int_buf[idx, 0] = -1
 
 
+@cuda.jit(device=True, inline=True, fastmath=True)
+def _safe_get_depth(D, y, x, h, w):
+    # mirror pad
+    if y < 0:
+        y = -y - 1
+    elif y >= h:
+        y = (h << 1) - 1 - y
+    if x < 0:
+        x = -x - 1
+    elif x >= w:
+        x = (w << 1) - 1 - x
+    return D[y, x]
+
+
+@cuda.jit(cache=True, fastmath=True)
+def prepare_depth_geom_kernel(
+    depth_oct,  # (H, W) float32
+    int_buf,
+    float_buf,  # extrema buffers
+    ext_count,  # int32[2], uses ext_count[0]
+    oct_idx,  # int
+    fx,
+    fy,
+    cx,
+    cy,  # full-res intrinsics
+    delta_min,  # scalar
+    Jt_out,  # (N,2,2)
+    min_aspect,  # float, e.g., 0.20 -> reject if s2/s1 < min_aspect
+    max_depth,  # float, discard if Z > max_depth
+):
+    k = cuda.grid(1)
+    if k >= ext_count[0] or int_buf[k, 0] != oct_idx:
+        return
+
+    # Fallback first (classic): identity warp
+    Jt_out[k, 0, 0] = 1.0
+    Jt_out[k, 0, 1] = 0.0
+    Jt_out[k, 1, 0] = 0.0
+    Jt_out[k, 1, 1] = 1.0
+
+    # Try depth-aware overwrite
+    scale = delta_min * (1 << oct_idx)
+    y0 = float_buf[k, 0] / scale
+    x0 = float_buf[k, 1] / scale
+
+    H, W = depth_oct.shape
+    yi = int(ld.floorf(y0 + 0.5))
+    xi = int(ld.floorf(x0 + 0.5))
+    if yi < 0 or yi >= H or xi < 0 or xi >= W:
+        return
+
+    Zc = depth_oct[yi, xi]
+    if not ld.finitef(Zc) or Zc <= 0.0 or Zc > max_depth:
+        return
+
+    fx_o = fx / scale
+    fy_o = fy / scale
+    cx_o = cx / scale
+    cy_o = cy / scale
+
+    # depth gradients (mirror padded)
+    Zxm = _safe_get_depth(depth_oct, yi, xi + 1, H, W) - _safe_get_depth(
+        depth_oct, yi, xi - 1, H, W
+    )
+    Zym = _safe_get_depth(depth_oct, yi + 1, xi, H, W) - _safe_get_depth(
+        depth_oct, yi - 1, xi, H, W
+    )
+    Zx = 0.5 * Zxm
+    Zy = 0.5 * Zym
+
+    # back-projection partials
+    Xn = (x0 - cx_o) / fx_o
+    Yn = (y0 - cy_o) / fy_o
+
+    dPdx_x = Zc / fx_o + Xn * Zx
+    dPdx_y = Yn * Zx
+    dPdx_z = Zx
+    dPdy_x = Xn * Zy
+    dPdy_y = Zc / fy_o + Yn * Zy
+    dPdy_z = Zy
+
+    # orthonormal tangent basis
+    nx = ld.sqrtf(dPdx_x * dPdx_x + dPdx_y * dPdx_y + dPdx_z * dPdx_z)
+    if nx < 1e-8:
+        return
+    e1x = dPdx_x / nx
+    e1y = dPdx_y / nx
+    e1z = dPdx_z / nx
+    dot12 = e1x * dPdy_x + e1y * dPdy_y + e1z * dPdy_z
+    v2x = dPdy_x - dot12 * e1x
+    v2y = dPdy_y - dot12 * e1y
+    v2z = dPdy_z - dot12 * e1z
+    ny = ld.sqrtf(v2x * v2x + v2y * v2y + v2z * v2z)
+    if ny < 1e-8:
+        return
+    e2x = v2x / ny
+    e2y = v2y / ny
+    e2z = v2z / ny
+
+    # surface->image mapping M; then J = M^{-1}
+    m00 = e1x * dPdy_x + e1y * dPdy_y + e1z * dPdy_z
+    m01 = e1x * dPdx_x + e1y * dPdx_y + e1z * dPdx_z
+    m10 = e2x * dPdy_x + e2y * dPdy_y + e2z * dPdy_z
+    m11 = e2x * dPdx_x + e2y * dPdx_y + e2z * dPdx_z
+
+    detM = m00 * m11 - m01 * m10
+    if ld.fabsf(detM) < 1e-8:
+        return
+
+    inv_det = 1.0 / detM
+    j00 = inv_det * m11
+    j01 = -inv_det * m01
+    j10 = -inv_det * m10
+    j11 = inv_det * m00
+
+    # singular values of J (closed form)
+    a2c2 = j00 * j00 + j10 * j10
+    b2d2 = j01 * j01 + j11 * j11
+    tr = a2c2 + b2d2
+    detJ = j00 * j11 - j01 * j10
+    disc = tr * tr - 4.0 * (detJ * detJ)
+    if disc < 0.0:
+        disc = 0.0
+    root = ld.sqrtf(disc)
+    s1 = ld.sqrtf(0.5 * (tr + root))  # max sv
+    s2 = ld.sqrtf(0.5 * (tr - root))  # min sv
+    if s1 <= 0.0:
+        return
+    if (s2 / s1) < min_aspect:
+        return
+
+    # major-axis normalization (tilt-only): J_n = J / s1  => Jt_n = J^T / s1
+    Jt_out[k, 0, 0] = j00 / s1
+    Jt_out[k, 0, 1] = j10 / s1
+    Jt_out[k, 1, 0] = j01 / s1
+    Jt_out[k, 1, 1] = j11 / s1
+
+
 def upscale(src, dst, delta_min, stream):
     assert delta_min <= 1.0
     hi, wi = src.shape
@@ -612,7 +760,7 @@ def upscale(src, dst, delta_min, stream):
 
 def gaussian_symm_kernel(sigma: float) -> tuple[DeviceNDArray, int]:
     radius = int(math.ceil(4.0 * float(sigma)))
-
+    radius = min(radius, MAX_GAUSS_RADIUS)
     g = np.empty(radius + 1, dtype=np.float32)
     g[0] = np.float32(1.0)
 
@@ -933,55 +1081,97 @@ def orientation_kernel(
     oct_idx,
     lambda_ori,
     delta_min,
+    Jt_all,
+    tilt_map,
 ):
     kp_idx = cuda.blockIdx.x
     if kp_idx >= n_extrema[0] or int_buf[kp_idx, 0] != oct_idx:
         return
+
     s = int_buf[kp_idx, 1]
     scale = delta_min * (1 << oct_idx)
     y0 = float_buf[kp_idx, 0] / scale
     x0 = float_buf[kp_idx, 1] / scale
-    sigma_w = float_buf[kp_idx, 2]
-    sigma_oct = sigma_w / scale
-    R = 3.0 * lambda_ori * sigma_oct
+    sigmaw = float_buf[kp_idx, 2]
+    sigmao = sigmaw / scale
+
+    R = 3.0 * lambda_ori * sigmao
     radius = int(R + 0.5)
     radius = 1 if radius == 0 else radius
     h, w = gx.shape[1:]
-    g_sigma = lambda_ori * sigma_oct
-    inv_2sig2 = 1.0 / (2.0 * g_sigma * g_sigma)
-    bin_scale = numba.float32(ORI_BINS / TWO_PI)
+    gsigma = lambda_ori * sigmao
+    inv2s2 = 1.0 / (2.0 * gsigma * gsigma)
+    binscl = numba.float32(ORI_BINS / TWO_PI)
+
+    # Load J^T and form J and inv(J) (assume upstream ensured det != 0)
+    jt00 = Jt_all[kp_idx, 0, 0]
+    jt01 = Jt_all[kp_idx, 0, 1]
+    jt10 = Jt_all[kp_idx, 1, 0]
+    jt11 = Jt_all[kp_idx, 1, 1]
+    j00 = jt00
+    j01 = jt10
+    j10 = jt01
+    j11 = jt11
+    det = j00 * j11 - j01 * j10
+    den = det + ld.copysignf(numba.float32(1e-12), det)
+    invd = 1.0 / den
+    inv00 = invd * j11
+    inv01 = -invd * j01
+    inv10 = -invd * j10
+    inv11 = invd * j00
+
+    # histogram
     hist = cuda.shared.array(ORI_BINS, numba.float32)
     tflat = cuda.threadIdx.y * TX + cuda.threadIdx.x
     if tflat < ORI_BINS:
         hist[tflat] = 0.0
     cuda.syncthreads()
+
+    # classical scan box (no circle gating)
     siMin = 0 if (y0 - R + 0.5) < 0.0 else int(y0 - R + 0.5)
     sjMin = 0 if (x0 - R + 0.5) < 0.0 else int(x0 - R + 0.5)
-    siMax_f = y0 + R + 0.5
-    sjMax_f = x0 + R + 0.5
-    siMax = h - 1 if siMax_f > (h - 1) else int(siMax_f)
-    sjMax = w - 1 if sjMax_f > (w - 1) else int(sjMax_f)
-    height = siMax - siMin + 1
-    width = sjMax - sjMin + 1
-    for dy in range(cuda.threadIdx.y, height, TY):
+    siMax = h - 1 if (y0 + R + 0.5) > (h - 1) else int(y0 + R + 0.5)
+    sjMax = w - 1 if (x0 + R + 0.5) > (w - 1) else int(x0 + R + 0.5)
+    Hbox = siMax - siMin + 1
+    Wbox = sjMax - sjMin + 1
+
+    for dy in range(cuda.threadIdx.y, Hbox, TY):
         yy = siMin + dy
         dyf = numba.float32(yy) - numba.float32(y0)
-        for dx in range(cuda.threadIdx.x, width, TX):
+        for dx in range(cuda.threadIdx.x, Wbox, TX):
             xx = sjMin + dx
             dxf = numba.float32(xx) - numba.float32(x0)
-            gxv = gx[s, yy, xx]
+
+            # image -> surface coords
+            u = inv00 * dyf + inv01 * dxf
+            v = inv10 * dyf + inv11 * dxf
+
+            # image gradients
             gyv = gy[s, yy, xx]
-            m = ld.sqrtf(gxv * gxv + gyv * gyv)
+            gxv = gx[s, yy, xx]
+
+            # rotate gradient to (u,v): g_uv = J^T g_yx  (y-first layout)
+            gu = jt00 * gyv + jt01 * gxv
+            gv = jt10 * gyv + jt11 * gxv
+
+            m = ld.sqrtf(gu * gu + gv * gv)
             if m == 0.0:
                 continue
-            a = wrap_angle(ld.atan2f(gxv, gyv))
-            wgt = m * ld.expf(-(dxf * dxf + dyf * dyf) * inv_2sig2)
-            bin_f = a * bin_scale + numba.float32(0.5)
+
+            # angle in surface coords (NOTE: when Jt==I -> atan2(gx,gy), i.e. classical)
+            a = wrap_angle(ld.atan2f(gv, gu))
+
+            # Gaussian weight in surface coords (NOTE: when Jt==I -> dx,dy)
+            wgt = m * ld.expf(-(u * u + v * v) * inv2s2)
+
+            bin_f = a * binscl + numba.float32(0.5)
             bin_i = int(ld.floorf(bin_f)) % ORI_BINS
             if bin_i < 0:
                 bin_i += ORI_BINS
             cuda.atomic.add(hist, bin_i, wgt)
+
     cuda.syncthreads()
+
     if tflat == 0:
         tmp = cuda.local.array(ORI_BINS, numba.float32)
         for _ in range(6):
@@ -991,32 +1181,43 @@ def orientation_kernel(
                 hist[i] = (
                     tmp[(i - 1) % ORI_BINS] + tmp[i] + tmp[(i + 1) % ORI_BINS]
                 ) / 3.0
+
         vmax = numba.float32(0.0)
         for i in range(ORI_BINS):
-            vmax = vmax if vmax > hist[i] else hist[i]
+            if hist[i] > vmax:
+                vmax = hist[i]
         if vmax == 0.0:
             return
+
         thr = ORI_THRESHOLD * vmax
         for i in range(ORI_BINS):
-            p, c, n = hist[(i - 1) % ORI_BINS], hist[i], hist[(i + 1) % ORI_BINS]
+            p = hist[(i - 1) % ORI_BINS]
+            c = hist[i]
+            n = hist[(i + 1) % ORI_BINS]
             if not (c > thr and c > p and c > n):
                 continue
             denom = p - 2.0 * c + n
             off = (p - n) / (2.0 * denom)
             theta = wrap_angle((i + off + 0.5) * (TWO_PI / ORI_BINS))
+
             out = cuda.atomic.add(kp_counter, 0, 1)
             if out >= key_float.shape[0]:
                 cuda.atomic.add(kp_counter, 0, -1)
                 cuda.atomic.add(kp_counter, 2, 1)
                 return
-            key_float[out, 0] = float_buf[kp_idx, 0]  # y_world
-            key_float[out, 1] = float_buf[kp_idx, 1]  # x_world
-            key_float[out, 2] = sigma_w  # sigma
-            key_float[out, 3] = theta  # orientation
-            key_int[out, 0] = oct_idx  # o
-            key_int[out, 1] = s  # s
-            key_int[out, 2] = int_buf[kp_idx, 2]  # y_int
-            key_int[out, 3] = int_buf[kp_idx, 3]  # x_int
+
+            key_float[out, 0] = float_buf[kp_idx, 0]
+            key_float[out, 1] = float_buf[kp_idx, 1]
+            key_float[out, 2] = sigmaw
+            key_float[out, 3] = theta
+            key_int[out, 0] = oct_idx
+            key_int[out, 1] = s
+            key_int[out, 2] = int_buf[kp_idx, 2]
+            key_int[out, 3] = int_buf[kp_idx, 3]
+            tilt_map[out, 0, 0] = jt00
+            tilt_map[out, 0, 1] = jt01
+            tilt_map[out, 1, 0] = jt10
+            tilt_map[out, 1, 1] = jt11
 
 
 def discard_on_edge(
@@ -1086,17 +1287,30 @@ def discard_near_the_border_kernel(
 
 
 @cuda.jit(cache=True, fastmath=True)
-def descriptor_kernel(gx, gy, key_float, key_int, kctr, desc, oct_idx, delta_min):
+def descriptor_kernel(
+    gx,
+    gy,
+    key_float,
+    key_int,
+    kctr,
+    desc,
+    oct_idx,
+    delta_min,
+    Jt_kp,  # NEW: per-keypoint J^T (shape: [max_kp, 2, 2])
+):
     kp_idx = cuda.blockIdx.x
     if kp_idx < kctr[1] or kp_idx >= kctr[0] or key_int[kp_idx, 0] != oct_idx:
         return
+
     s = key_int[kp_idx, 1]
     yw = key_float[kp_idx, 0]
     xw = key_float[kp_idx, 1]
-    sigma = key_float[kp_idx, 2]
-    theta0 = key_float[kp_idx, 3]
+    sigma = key_float[kp_idx, 2]  # full-res sigma (classic)
+    theta0 = key_float[kp_idx, 3]  # dominant orientation IN SURFACE (from ori kernel)
+
     scale = delta_min * (1 << oct_idx)
     x0, y0 = xw / scale, yw / scale
+
     radiusF = LAMBDA_DESC * sigma / scale
     inv_2sig2 = 1.0 / (2.0 * radiusF * radiusF)
     bin_scale = NORIBIN / TWO_PI
@@ -1116,39 +1330,84 @@ def descriptor_kernel(gx, gy, key_float, key_int, kctr, desc, oct_idx, delta_min
     height = max(0, siMax - siMin)
     width = max(0, sjMax - sjMin)
 
-    c, snt = ld.cosf(theta0), ld.sinf(theta0)
+    # --- NEW: load J^T for this keypoint and build inv(J) once per block
+    jt00 = Jt_kp[kp_idx, 0, 0]
+    jt01 = Jt_kp[kp_idx, 0, 1]
+    jt10 = Jt_kp[kp_idx, 1, 0]
+    jt11 = Jt_kp[kp_idx, 1, 1]
+    # J = (Jt)^T
+    j00 = jt00
+    j01 = jt10
+    j10 = jt01
+    j11 = jt11
+    detJ = j00 * j11 - j01 * j10
+    inv00 = numba.float32(1.0)
+    inv01 = numba.float32(0.0)
+    inv10 = numba.float32(0.0)
+    inv11 = numba.float32(1.0)
+    if ld.fabsf(detJ) >= 1e-8:  # if singular, identity fallback
+        inv_det = 1.0 / detJ
+        inv00 = inv_det * j11
+        inv01 = -inv_det * j01
+        inv10 = -inv_det * j10
+        inv11 = inv_det * j00
+
+    # rotation terms (same as classic, but applied in SURFACE coords)
+    c = ld.cosf(theta0)
+    sn = ld.sinf(theta0)
+
     hist = cuda.shared.array(DESC_LEN, numba.float32)
     tflat = cuda.threadIdx.y * TX + cuda.threadIdx.x
     if tflat < DESC_LEN:
         hist[tflat] = 0.0
     cuda.syncthreads()
+
     for py in range(cuda.threadIdx.y, height, TY):
         yy = siMin + py
-        dy0 = yy - y0
+        dy0 = numba.float32(yy) - numba.float32(y0)
         for px in range(cuda.threadIdx.x, width, TX):
             xx = sjMin + px
-            dx0 = xx - x0
+            dx0 = numba.float32(xx) - numba.float32(x0)
 
-            dx = dy0 * c + dx0 * snt
-            dy = -dy0 * snt + dx0 * c
-            u = dy * inv_cell + half_bins
-            v = dx * inv_cell + half_bins
+            # --- NEW: image offset -> SURFACE coords (u,v) using inv(J)
+            u = inv00 * dy0 + inv01 * dx0
+            v = inv10 * dy0 + inv11 * dx0
+
+            # --- CHANGED: rotate SURFACE coords by theta0 (same formulas as classic)
+            # classic does:
+            #   dx =  dy0*c + dx0*sn
+            #   dy = -dy0*sn + dx0*c
+            # here we replace (dy0,dx0) with (u,v)
+            dx = u * c + v * sn
+            dy = -u * sn + v * c
+
             if not (ld.fabsf(dx) < R and ld.fabsf(dy) < R):
                 continue
-            gxv = gx[s, yy, xx]
+
+            # gradients in IMAGE, then --- NEW: transform to SURFACE via J^T
             gyv = gy[s, yy, xx]
-            m = ld.sqrtf(gxv * gxv + gyv * gyv)
+            gxv = gx[s, yy, xx]
+            gu = jt00 * gyv + jt01 * gxv  # NEW
+            gv = jt10 * gyv + jt11 * gxv  # NEW
+
+            m = ld.sqrtf(gu * gu + gv * gv)  # magnitude in SURFACE  (NEW)
             if m == 0.0:
                 continue
-            a = wrap_angle(ld.atan2f(gxv, gyv) - theta0)
+
+            # angle in SURFACE relative to theta0 (NEW)
+            a = wrap_angle(ld.atan2f(gv, gu) - theta0)
             ob = a * bin_scale
-            u0 = int(ld.floorf(u))
-            du = u - u0
-            v0 = int(ld.floorf(v))
-            dv = v - v0
+
+            # same trilinear vote as classic, but weight uses SURFACE distance
+            u0 = int(ld.floorf(dy * inv_cell + half_bins))
+            du = (dy * inv_cell + half_bins) - u0
+            v0 = int(ld.floorf(dx * inv_cell + half_bins))
+            dv = (dx * inv_cell + half_bins) - v0
             o0 = int(ob)
             do = ob - o0
+
             wbase = m * ld.expf(-(dx * dx + dy * dy) * inv_2sig2)
+
             for iu in (0, 1):
                 uu = u0 + iu
                 if 0 <= uu < NHIST:
@@ -1162,13 +1421,15 @@ def descriptor_kernel(gx, gy, key_float, key_int, kctr, desc, oct_idx, delta_min
                                 wo = (1 - do) if io == 0 else do
                                 hidx = ((uu * NHIST + vv) * NORIBIN) + oo
                                 cuda.atomic.add(hist, hidx, wbase * wu * wv * wo)
+
     cuda.syncthreads()
+
     if tflat == 0:
+        # normalization + clipping (unchanged)
         l2 = numba.float32(0.0)
         for i in range(DESC_LEN):
             l2 += hist[i] * hist[i]
-        norm = ld.sqrtf(l2) + 1e-12
-        inv = 1.0 / norm
+        inv = 1.0 / (ld.sqrtf(l2) + 1e-12)
 
         l2p = numba.float32(0.0)
         for i in range(DESC_LEN):
@@ -1176,8 +1437,7 @@ def descriptor_kernel(gx, gy, key_float, key_int, kctr, desc, oct_idx, delta_min
             v = 0.2 if v > 0.2 else v
             hist[i] = v
             l2p += v * v
-        norm2 = ld.sqrtf(l2p) + 1e-12
-        inv2 = 1.0 / norm2
+        inv2 = 1.0 / (ld.sqrtf(l2p) + 1e-12)
 
         for i in range(DESC_LEN):
             q = hist[i] * inv2 * 512.0
@@ -1207,6 +1467,8 @@ def build_descriptors(
         octave_index,
         params.lambda_ori,
         params.delta_min,
+        data.tilt_map,
+        data.keypoints.tilt_map,
     )
 
     descriptor_kernel[(params.max_keypoints,), (TX, TY), stream](
@@ -1218,6 +1480,7 @@ def build_descriptors(
         data.keypoints.descriptors,
         octave_index,
         params.delta_min,
+        data.keypoints.tilt_map,
     )
 
     if record:
@@ -1235,11 +1498,72 @@ def build_descriptors(
         return None
 
 
-def compute_octave(
+@cuda.jit(cache=True, fastmath=True)
+def set_identity_tilt_kernel(int_buf, ext_count, oct_idx, Jt_out):
+    k = cuda.grid(1)
+    if k >= ext_count[0] or int_buf[k, 0] != oct_idx:
+        return
+    Jt_out[k, 0, 0] = 1.0
+    Jt_out[k, 0, 1] = 0.0
+    Jt_out[k, 1, 0] = 0.0
+    Jt_out[k, 1, 1] = 1.0
+
+
+def prepare_depth_geoms(
     data: SiftData,
     params: SiftParams,
     octave_index: int,
     stream,
+    K,
+    use_depth: bool = True,  # <— NEW
+    record: bool = False,
+):
+    threads = 128
+    blocks = (params.max_extrema + threads - 1) // threads
+
+    if not use_depth:
+        # Classical mode: fill per-extremum J^T with identity
+        set_identity_tilt_kernel[blocks, threads, stream](
+            data.extrema.int_buffer,
+            data.extrema.counter,
+            int(octave_index),
+            data.tilt_map,
+        )
+    else:
+        # Depth-aware mode: compute J^T from depth
+        prepare_depth_geom_kernel[blocks, threads, stream](
+            data.depth[octave_index],
+            data.extrema.int_buffer,
+            data.extrema.float_buffer,
+            data.extrema.counter,
+            int(octave_index),
+            float(K[0, 0]),
+            float(K[1, 1]),
+            float(K[0, 2]),
+            float(K[1, 2]),
+            numba.float32(params.delta_min),
+            data.tilt_map,
+            params.min_aspect,
+            params.max_depth,
+        )
+
+    if record:
+        total = int(data.extrema.counter.copy_to_host(stream=stream)[0])
+        if total > 0:
+            ib = data.extrema.int_buffer[:total].copy_to_host(stream=stream)
+            mask = ib[:, 0] == octave_index
+            if mask.any():
+                return data.tilt_map[:total].copy_to_host(stream=stream)[mask]
+        return None
+
+
+def compute_octave(
+    data: SiftData,
+    params: SiftParams,
+    octave_index: int,
+    K,
+    stream,
+    use_depth: bool,
     record: bool = False,
 ) -> Optional[Dict[str, object]]:
     snapshot: dict[str, object] = {}
@@ -1254,7 +1578,9 @@ def compute_octave(
     snapshot["gss"], snapshot["grad_x"], snapshot["grad_y"] = compute_gss(
         data, params, octave_index, stream, record
     )
-    snapshot["depth"] = compute_depth(data, params, octave_index, stream, record)
+    snapshot["depth"] = (
+        compute_depth(data, params, octave_index, stream, record) if use_depth else None
+    )
     snapshot["dog"] = compute_dog(data, params, octave_index, stream, record)
     snapshot["extrema"] = detect_extrema(data, params, octave_index, stream, record)
     snapshot["contrast_pre"] = discard_with_low_response(
@@ -1267,6 +1593,9 @@ def compute_octave(
     snapshot["edge"] = discard_on_edge(data, params, octave_index, stream, record)
     snapshot["border"] = discard_near_the_border(
         data, params, octave_index, stream, record
+    )
+    snapshot["tilt_map"] = prepare_depth_geoms(
+        data, params, octave_index, stream, K, use_depth, record
     )
     snapshot["keys"] = build_descriptors(data, params, octave_index, stream, record)
 
@@ -1299,24 +1628,30 @@ def compute(
     data: SiftData,
     params: SiftParams,
     stream,
-    img,
-    depth,
+    img: np.ndarray,
+    depth: Optional[np.ndarray],  # <— NEW
+    K: np.ndarray,
     record: bool = False,
 ) -> list[dict[str, object]]:
     snapshots: list[dict[str, object]] = []
 
     data.input_img.copy_to_device(img.astype(np.float32), stream)
-    data.input_depth.copy_to_device(depth.astype(np.float32), stream)
+
+    use_depth = depth is not None
+    if use_depth:
+        data.input_depth.copy_to_device(depth.astype(np.float32), stream)
+
     data.extrema.counter.copy_to_device(np.array([0, 0], dtype=np.int32), stream)
     data.keypoints.counter.copy_to_device(np.array([0, 0, 0], dtype=np.int32), stream)
 
     for o in range(params.n_oct):
-        snapshot = compute_octave(data, params, o, stream, record)
+        snapshot = compute_octave(data, params, o, K, stream, use_depth, record)
         snapshots.append(snapshot)
 
     data.keypoints.int_buffer.copy_to_host(data.keypoints_host.int_buffer, stream)
     data.keypoints.float_buffer.copy_to_host(data.keypoints_host.float_buffer, stream)
     data.keypoints.descriptors.copy_to_host(data.keypoints_host.descriptors, stream)
+    data.keypoints.tilt_map.copy_to_host(data.keypoints_host.tilt_map, stream)
     data.keypoints.counter.copy_to_host(data.keypoints_host.counter, stream)
 
     return snapshots
@@ -1330,33 +1665,117 @@ class Sift:
         self._stream = cuda.external_stream(self._cp_stream.ptr)
 
     def compute(
-        self, img_path: str, depth_path: str, record: bool = False
-    ) -> KeypointsHost:
-        img = read_gray_bt709(img_path)
-        depth = np.load(depth_path)
+        self,
+        img: np.ndarray,
+        depth: Optional[np.ndarray],  # <— NEW
+        K: Optional[np.ndarray],
+        record: bool = False,
+    ) -> tuple[KeypointsHost, list[dict[str, object]]]:
         assert img.shape == self.params.img_dims, (
             f"got {img.shape}, expected {self.params.img_dims}"
         )
-        assert depth.shape == self.params.depth_dims, (
-            f"got depth {depth.shape}, expected {self.params.depth_dims}"
-        )
+        if depth is not None:
+            assert depth.shape == self.params.depth_dims, (
+                f"got depth {depth.shape}, expected {self.params.depth_dims}"
+            )
+
+        K = np.eye(3) if K is None else K
+
         snapshot = compute(
-            self.data, self.params, self._stream, img, depth, record=record
+            self.data, self.params, self._stream, img, depth, K, record=record
         )
         return self.data.keypoints_host.copy(), snapshot
 
-    def compute_many(self, img_paths: Iterable[str], record: bool = False):
-        for p in img_paths:
-            yield self.compute_from_path(p, record=record)
+
+def draw_random_affine_keypoints(
+    img: np.ndarray,
+    key_int: np.ndarray,
+    key_float: np.ndarray,
+    tilt_map: np.ndarray,
+    *,
+    n_samples: int = 200,
+    magnify: float = 3.0,
+    delta_min: float = 0.5,
+    n_pts: int = 64,
+    color=(0, 0, 255),
+    outline=(255, 255, 255),
+    thick: int = 2,
+    border: int = 1,
+    seed: int | None = 0,
+):
+    import cv2
+    import numpy as np
+
+    assert key_int.ndim == 2 and key_int.shape[1] == 4
+    assert key_float.ndim == 2 and key_float.shape[1] == 4
+    assert tilt_map.ndim == 3 and tilt_map.shape[1:] == (2, 2)
+
+    N = min(len(key_int), len(key_float), len(tilt_map))
+    if N == 0:
+        return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR) if img.ndim == 2 else img
+
+    C = key_float[:N, :2]
+    Jt = tilt_map[:N]
+    valid = np.isfinite(C).all(axis=1) & np.isfinite(Jt.reshape(N, -1)).all(axis=1)
+    idx = np.flatnonzero(valid)
+    if idx.size == 0:
+        return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR) if img.ndim == 2 else img
+
+    rng = np.random.default_rng(seed)
+    sel = rng.choice(idx, size=min(n_samples, idx.size), replace=False)
+    out = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR) if img.ndim == 2 else img.copy()
+
+    t = np.linspace(0.0, 2.0 * np.pi, int(max(8, n_pts)), endpoint=True).astype(
+        np.float32
+    )
+    uv = np.stack([np.cos(t), np.sin(t)], axis=1).astype(np.float32)
+    t_outline = thick + 2 * border
+
+    for i in sel:
+        o = int(key_int[i, 0])
+        cy, cx = map(float, C[i])
+        ang = float(key_float[i, 3])
+        s = float(delta_min) * float(1 << o) * float(magnify)
+        J = Jt[i].T.astype(np.float32, copy=False)
+
+        poly = (uv @ J.T) * s
+        poly = np.stack([cx + poly[:, 1], cy + poly[:, 0]], axis=1)
+        poly_i = np.round(poly).astype(np.int32).reshape(-1, 1, 2)
+
+        udir = np.array([np.cos(ang), np.sin(ang)], np.float32)
+        d = (J @ udir) * s
+        ctr = (int(round(cx)), int(round(cy)))
+        tip = (int(round(cx + float(d[1]))), int(round(cy + float(d[0]))))
+
+        cv2.polylines(out, [poly_i], True, outline, t_outline, lineType=cv2.LINE_AA)
+        cv2.line(out, ctr, tip, outline, t_outline, lineType=cv2.LINE_AA)
+        cv2.circle(out, ctr, max(t_outline // 2, 1), outline, -1, lineType=cv2.LINE_AA)
+
+        cv2.polylines(out, [poly_i], True, color, thick, lineType=cv2.LINE_AA)
+        cv2.line(out, ctr, tip, color, thick, lineType=cv2.LINE_AA)
+        cv2.circle(out, ctr, max(thick // 2, 1), color, -1, lineType=cv2.LINE_AA)
+
+    return out
 
 
 if __name__ == "__main__":
     params = SiftParams(img_dims=(1440, 1920), depth_dims=(192, 256))
     sift = Sift(params)
 
-    m = np.load("data/sidewalk/intrinsics.npy")[37]
-    K = [m[0, 0], m[1, 1], m[0, 2], m[1, 2]]
+    idx1 = 0
+    K1 = np.load("data/sidewalk/intrinsics.npy")[idx1]
+    img1 = read_gray_bt709(f"data/sidewalk/images/{idx1}.png")
+    depth1 = np.load(f"data/sidewalk/depths/{idx1}.npy")
 
-    res1, snapshot1 = sift.compute("data/sidewalk/img1.png", "data/sidewalk/depth1.npy")
+    res1, snapshot1 = sift.compute(img1, depth1, K1, record=True)
 
-    print(res1.counter)
+    # Load the full-resolution image for visualization (grayscale)
+    overlay = draw_random_affine_keypoints(
+        cv2.imread(f"data/sidewalk/images/{idx1}.png", cv2.IMREAD_GRAYSCALE),
+        res1.int_buffer,
+        res1.float_buffer,
+        res1.tilt_map,
+        n_samples=1000,
+        magnify=50,
+    )
+    cv2.imwrite("keypoints.png", overlay)

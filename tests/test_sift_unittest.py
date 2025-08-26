@@ -1,8 +1,9 @@
+import json
 import os
 import sys
-import json
 import unittest
 from pathlib import Path
+
 import numpy as np
 
 
@@ -15,7 +16,6 @@ class SiftComputeMixin:
     REFINED_ATOL = np.array([5e-3, 5e-3, 6e-4, 1e-6], dtype=np.float32)
 
     IMG_PATH: str | None = None
-
 
     @classmethod
     def setUpClass(cls):
@@ -39,9 +39,9 @@ class SiftComputeMixin:
         sys.path.append(str(cls.root))
         from proto2 import (
             SiftParams,
+            compute,
             create_sift_data,
             read_gray_bt709,
-            compute,
         )
 
         img = read_gray_bt709(str(cls.img_path))
@@ -51,9 +51,12 @@ class SiftComputeMixin:
         from numba import cuda
 
         stream = cuda.stream()
-        # Create a dummy depth map compatible with params.depth_dims
-        depth = np.ones_like(img, dtype=np.float32)
-        cls.snapshots = compute(cls.data, cls.params, stream, img, depth, record=True)
+        # Create a dummy intrinsics; ignored in classical (no-depth) mode
+
+        # Classical SIFT: pass depth=None
+        cls.snapshots = compute(
+            cls.data, cls.params, stream, img, None, None, record=True
+        )
 
         # Use the image filename stem to name the artifact directory
         img_stem = cls.img_path.stem
@@ -205,7 +208,6 @@ class SiftComputeMixin:
             "grad_y",
             self.TOL_ARRAY,
         )
-
 
     def test_oriented_keypoints_match_cli_dump(self):
         keys_dir = self.record_dir / "keys"
@@ -634,12 +636,9 @@ class SiftComputeMixin:
                 self._assert_shapes_dtypes(self.snapshots[o]["border"], floats_cols=4)
 
 
-
 class TestSiftImg1(SiftComputeMixin, unittest.TestCase):
     IMG_PATH = "data/oxford_affine/graf/img1.png"
 
 
 class TestSiftImg2(SiftComputeMixin, unittest.TestCase):
     IMG_PATH = "data/oxford_affine/graf/img2.png"
-
-    
