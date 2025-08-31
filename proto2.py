@@ -1784,6 +1784,191 @@ def draw_random_affine_keypoints(
     return out
 
 
+def match_symmetric_ratio_and_essential(
+    kp1: KeypointsHost,
+    kp2: KeypointsHost,
+    K1: np.ndarray,
+    K2: np.ndarray,
+    ratio: float = 0.75,
+    method: int = cv2.RANSAC,
+    prob: float = 0.999,
+    threshold: float = 1.0,
+):
+    """Match SIFT features with symmetric Lowe's ratio, then filter with E.
+
+    Returns a dict containing:
+      - pairs_idx: (M,2) int indices into kp1/kp2
+      - pts1: (M,2) float32 pixel coords (x,y) in image1
+      - pts2: (M,2) float32 pixel coords (x,y) in image2
+      - E: (3,3) essential matrix or None
+      - inlier_mask: (M,) uint8 mask from RANSAC (all ones here since already filtered)
+    """
+    n1 = int(kp1.counter[0]) if kp1.counter.size > 0 else len(kp1.descriptors)
+    n2 = int(kp2.counter[0]) if kp2.counter.size > 0 else len(kp2.descriptors)
+    if n1 == 0 or n2 == 0:
+        return {
+            "pairs_idx": np.empty((0, 2), dtype=np.int32),
+            "pts1": np.empty((0, 2), dtype=np.float32),
+            "pts2": np.empty((0, 2), dtype=np.float32),
+            "E": None,
+            "inlier_mask": np.empty((0,), dtype=np.uint8),
+        }
+
+    desc1 = kp1.descriptors[:n1].astype(np.float32, copy=False)
+    desc2 = kp2.descriptors[:n2].astype(np.float32, copy=False)
+
+    bf = cv2.BFMatcher(cv2.NORM_L2, crossCheck=False)
+
+    # Forward ratio
+    fwd = {}
+    for knn in bf.knnMatch(desc1, desc2, k=2):
+        if len(knn) < 2:
+            continue
+        m, n = knn[0], knn[1]
+        if m.distance < ratio * n.distance:
+            fwd[m.queryIdx] = m.trainIdx
+
+    # Backward ratio
+    bwd = {}
+    for knn in bf.knnMatch(desc2, desc1, k=2):
+        if len(knn) < 2:
+            continue
+        m, n = knn[0], knn[1]
+        if m.distance < ratio * n.distance:
+            bwd[m.queryIdx] = m.trainIdx
+
+    # Symmetric keep
+    pairs = [(i, j) for i, j in fwd.items() if bwd.get(j, -1) == i]
+    if len(pairs) == 0:
+        return {
+            "pairs_idx": np.empty((0, 2), dtype=np.int32),
+            "pts1": np.empty((0, 2), dtype=np.float32),
+            "pts2": np.empty((0, 2), dtype=np.float32),
+            "E": None,
+            "inlier_mask": np.empty((0,), dtype=np.uint8),
+        }
+
+    pairs_idx = np.asarray(pairs, dtype=np.int32)
+
+    # Build pixel coords (OpenCV expects x,y)
+    xy1 = np.stack(
+        [kp1.float_buffer[pairs_idx[:, 0], 1], kp1.float_buffer[pairs_idx[:, 0], 0]],
+        axis=1,
+    ).astype(np.float32)
+    xy2 = np.stack(
+        [kp2.float_buffer[pairs_idx[:, 1], 1], kp2.float_buffer[pairs_idx[:, 1], 0]],
+        axis=1,
+    ).astype(np.float32)
+
+    # Normalize by intrinsics to use the focal/pp variant robustly
+    fx1, fy1 = float(K1[0, 0]), float(K1[1, 1])
+    cx1, cy1 = float(K1[0, 2]), float(K1[1, 2])
+    fx2, fy2 = float(K2[0, 0]), float(K2[1, 1])
+    cx2, cy2 = float(K2[0, 2]), float(K2[1, 2])
+
+    norm1 = np.column_stack(((xy1[:, 0] - cx1) / fx1, (xy1[:, 1] - cy1) / fy1)).astype(
+        np.float32
+    )
+    norm2 = np.column_stack(((xy2[:, 0] - cx2) / fx2, (xy2[:, 1] - cy2) / fy2)).astype(
+        np.float32
+    )
+
+    # Estimate E with RANSAC on normalized coords
+    E, mask = cv2.findEssentialMat(
+        norm1,
+        norm2,
+        1.0,
+        (0.0, 0.0),
+        method=method,
+        prob=prob,
+        threshold=threshold,
+    )
+
+    if E is None or mask is None:
+        return {
+            "pairs_idx": np.empty((0, 2), dtype=np.int32),
+            "pts1": np.empty((0, 2), dtype=np.float32),
+            "pts2": np.empty((0, 2), dtype=np.float32),
+            "E": E,
+            "inlier_mask": np.empty((0,), dtype=np.uint8),
+        }
+
+    inl = mask.ravel().astype(bool)
+    pairs_idx = pairs_idx[inl]
+    xy1 = xy1[inl]
+    xy2 = xy2[inl]
+    inlier_mask = (np.ones(len(xy1)) * 1).astype(np.uint8)
+
+    return {
+        "pairs_idx": pairs_idx,
+        "pts1": xy1,
+        "pts2": xy2,
+        "E": E,
+        "inlier_mask": inlier_mask,
+    }
+
+
+def draw_matches_side_by_side(
+    img1: np.ndarray,
+    img2: np.ndarray,
+    pts1: np.ndarray,
+    pts2: np.ndarray,
+    inlier_mask: Optional[np.ndarray] = None,
+    *,
+    max_draw: int = 1000,
+    radius: int = 3,
+    thickness: int = 1,
+    seed: Optional[int] = 0,
+) -> np.ndarray:
+    """Draw side-by-side matches with connecting lines.
+
+    img1, img2: grayscale or BGR images
+    pts1, pts2: (N,2) float32 xy pixel coordinates
+    inlier_mask: optional (N,) mask to pre-select inliers
+    """
+    if img1.ndim == 2:
+        left = cv2.cvtColor(img1, cv2.COLOR_GRAY2BGR)
+    else:
+        left = img1.copy()
+    if img2.ndim == 2:
+        right = cv2.cvtColor(img2, cv2.COLOR_GRAY2BGR)
+    else:
+        right = img2.copy()
+
+    h = max(left.shape[0], right.shape[0])
+    w = left.shape[1] + right.shape[1]
+    canvas = np.zeros((h, w, 3), dtype=np.uint8)
+    canvas[: left.shape[0], : left.shape[1]] = left
+    canvas[: right.shape[0], left.shape[1] : left.shape[1] + right.shape[1]] = right
+
+    N = len(pts1)
+    if N == 0:
+        return canvas
+    mask = np.ones(N, dtype=bool) if inlier_mask is None else inlier_mask.astype(bool)
+    idx = np.flatnonzero(mask)
+    if idx.size == 0:
+        return canvas
+    if max_draw is not None and idx.size > max_draw:
+        rng = np.random.default_rng(seed)
+        idx = rng.choice(idx, size=max_draw, replace=False)
+
+    offset_x = left.shape[1]
+    for k in idx:
+        x1, y1 = float(pts1[k, 0]), float(pts1[k, 1])
+        x2, y2 = float(pts2[k, 0]) + float(offset_x), float(pts2[k, 1])
+        c = (
+            int(37 * (k % 7) + 80) % 255,
+            int(53 * (k % 5) + 60) % 255,
+            int(97 * (k % 9) + 40) % 255,
+        )
+        p1 = (int(round(x1)), int(round(y1)))
+        p2 = (int(round(x2)), int(round(y2)))
+        cv2.circle(canvas, p1, radius, (255, 255, 255), -1, lineType=cv2.LINE_AA)
+        cv2.circle(canvas, p2, radius, (255, 255, 255), -1, lineType=cv2.LINE_AA)
+        cv2.line(canvas, p1, p2, c, thickness, lineType=cv2.LINE_AA)
+    return canvas
+
+
 if __name__ == "__main__":
     params = SiftParams(img_dims=(1440, 1920), depth_dims=(192, 256))
     sift = Sift(params)
@@ -1795,6 +1980,13 @@ if __name__ == "__main__":
 
     res1, snapshot1 = sift.compute(img1, depth1, K1, record=True)
 
+    idx2 = 159
+    K2 = np.load("data/sidewalk/intrinsics.npy")[idx2]
+    img2 = read_gray_bt709(f"data/sidewalk/images/{idx2}.png")
+    depth2 = np.load(f"data/sidewalk/depths/{idx2}.npy")
+
+    res2, snapshot2 = sift.compute(img2, depth2, K2, record=True)
+
     # Load the full-resolution image for visualization (grayscale)
     overlay = draw_random_affine_keypoints(
         cv2.imread(f"data/sidewalk/images/{idx1}.png", cv2.IMREAD_GRAYSCALE),
@@ -1805,3 +1997,20 @@ if __name__ == "__main__":
         magnify=50,
     )
     cv2.imwrite("keypoints.png", overlay)
+    # Match and draw
+    matches = match_symmetric_ratio_and_essential(
+        res1, res2, K1, K2, ratio=0.75, method=cv2.RANSAC, prob=0.999, threshold=1.0
+    )
+    print(f"Num inlier matches: {matches['pts1'].shape[0]}")
+    img1_vis = cv2.imread(f"data/sidewalk/images/{idx1}.png", cv2.IMREAD_GRAYSCALE)
+    img2_vis = cv2.imread(f"data/sidewalk/images/{idx2}.png", cv2.IMREAD_GRAYSCALE)
+    match_vis = draw_matches_side_by_side(
+        img1_vis,
+        img2_vis,
+        matches["pts1"],
+        matches["pts2"],
+        matches["inlier_mask"],
+        max_draw=1000,
+        thickness=2,
+    )
+    cv2.imwrite("matches.png", match_vis)
