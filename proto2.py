@@ -5,7 +5,6 @@ import os
 import warnings
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, Optional
-
 import cupy as cp
 import cv2
 import numba
@@ -51,7 +50,9 @@ def read_gray_bt709(path: str) -> np.ndarray:
 @dataclass
 class SiftParams:
     img_dims: tuple[int, int]
-    depth_dims: tuple[int, int]
+    # Whether to record intermediate results (snapshots) during compute().
+    # This is fixed per-params to avoid per-call changes.
+    record: bool = False
     n_oct: int = -1
     n_spo: int = 3
     sigma_in: float = 0.5
@@ -182,14 +183,12 @@ class KeypointsHost:
 @dataclass
 class SiftData:
     input_img: DeviceNDArray
-    input_depth: DeviceNDArray
     seed_img: DeviceNDArray
     scratch: tuple[DeviceNDArray, ...]
     gss: tuple[DeviceNDArray, ...]
     dog: tuple[DeviceNDArray, ...]
     gx: tuple[DeviceNDArray, ...]
     gy: tuple[DeviceNDArray, ...]
-    depth: tuple[DeviceNDArray, ...]
     extrema: Extrema
     keypoints: Keypoints
     keypoints_host: KeypointsHost
@@ -205,9 +204,8 @@ def _alloc_octave_tensors(params: SiftParams, octave_index: int):
     scratch = cuda.device_array((height, width), np.float32)
     gx = cuda.device_array((num_gss_scales, height, width), np.float32)
     gy = cuda.device_array((num_gss_scales, height, width), np.float32)
-    depth = cuda.device_array((height, width), np.float32)
 
-    return gss, dog, scratch, gx, gy, depth
+    return gss, dog, scratch, gx, gy
 
 
 def create_extrema(params: SiftParams) -> Extrema:
@@ -236,7 +234,7 @@ def create_keypoints_host(params: SiftParams) -> KeypointsHost:
 
 
 def create_sift_data(params: SiftParams) -> SiftData:
-    gss, dog, scratch, gx, gy, depth = zip(
+    gss, dog, scratch, gx, gy = zip(
         *(
             _alloc_octave_tensors(params, octave_index)
             for octave_index in range(params.n_oct)
@@ -245,14 +243,12 @@ def create_sift_data(params: SiftParams) -> SiftData:
     h0, w0 = params.gss_shapes[0]
     return SiftData(
         input_img=cuda.device_array(params.img_dims, np.float32),
-        input_depth=cuda.device_array(params.depth_dims, np.float32),
         seed_img=cuda.device_array((h0, w0), np.float32),
         scratch=tuple(scratch),
         gss=tuple(gss),
         dog=tuple(dog),
         gx=tuple(gx),
         gy=tuple(gy),
-        depth=tuple(depth),
         extrema=create_extrema(params),
         keypoints=create_keypoints(params),
         keypoints_host=create_keypoints_host(params),
@@ -687,39 +683,6 @@ def compute_gss(
             gy.copy_to_host(stream=stream),
         )
     return None, None, None
-
-
-def compute_depth(
-    data: SiftData,
-    params: SiftParams,
-    octave_index: int,
-    stream,
-    record: bool = False,
-):
-    if octave_index == 0:
-        in_h, in_w = data.input_depth.shape
-        out_h, out_w = data.depth[0].shape
-        delta_h = float(in_h) / float(out_h)
-        delta_w = float(in_w) / float(out_w)
-        if not (abs(delta_h - delta_w) <= 1e-6):
-            raise ValueError(
-                f"Depth upsample ratios mismatch (h: {delta_h}, w: {delta_w});"
-                f" cannot upscale input depth of shape {(in_h, in_w)} to {(out_h, out_w)}"
-            )
-        upscale(data.input_depth, data.depth[0], float(delta_h), stream)
-        if record:
-            return data.depth[0].copy_to_host(stream=stream)
-        return None
-
-    src = data.depth[octave_index - 1]
-    dst = data.depth[octave_index]
-    height, width = params.gss_shapes[octave_index]
-    grid = ((width + TX - 1) // TX, (height + TY - 1) // TY)
-    downsample_kernel[grid, (TX, TY), stream](src, dst)
-
-    if record:
-        return dst.copy_to_host(stream=stream)
-    return None
 
 
 def compute_dog(
@@ -1240,9 +1203,9 @@ def compute_octave(
     params: SiftParams,
     octave_index: int,
     stream,
-    record: bool = False,
 ) -> Optional[Dict[str, object]]:
     snapshot: dict[str, object] = {}
+    record = bool(params.record)
 
     data.extrema.counter.copy_to_device(np.array([0, 0], dtype=np.int32), stream)
 
@@ -1254,7 +1217,6 @@ def compute_octave(
     snapshot["gss"], snapshot["grad_x"], snapshot["grad_y"] = compute_gss(
         data, params, octave_index, stream, record
     )
-    snapshot["depth"] = compute_depth(data, params, octave_index, stream, record)
     snapshot["dog"] = compute_dog(data, params, octave_index, stream, record)
     snapshot["extrema"] = detect_extrema(data, params, octave_index, stream, record)
     snapshot["contrast_pre"] = discard_with_low_response(
@@ -1295,68 +1257,76 @@ def set_first_scale(data: SiftData, params: SiftParams, octave_index: int, strea
     downsample_kernel[grid, (TX, TY), stream](src, dst)
 
 
-def compute(
-    data: SiftData,
-    params: SiftParams,
-    stream,
-    img,
-    depth,
-    record: bool = False,
-) -> list[dict[str, object]]:
-    snapshots: list[dict[str, object]] = []
-
-    data.input_img.copy_to_device(img.astype(np.float32), stream)
-    data.input_depth.copy_to_device(depth.astype(np.float32), stream)
-    data.extrema.counter.copy_to_device(np.array([0, 0], dtype=np.int32), stream)
-    data.keypoints.counter.copy_to_device(np.array([0, 0, 0], dtype=np.int32), stream)
-
-    for o in range(params.n_oct):
-        snapshot = compute_octave(data, params, o, stream, record)
-        snapshots.append(snapshot)
-
-    data.keypoints.int_buffer.copy_to_host(data.keypoints_host.int_buffer, stream)
-    data.keypoints.float_buffer.copy_to_host(data.keypoints_host.float_buffer, stream)
-    data.keypoints.descriptors.copy_to_host(data.keypoints_host.descriptors, stream)
-    data.keypoints.counter.copy_to_host(data.keypoints_host.counter, stream)
-
-    return snapshots
-
-
 class Sift:
     def __init__(self, params: SiftParams):
         self.params = params
         self.data = create_sift_data(params)
-        self._cp_stream = cp.cuda.Stream(non_blocking=True)
-        self._stream = cuda.external_stream(self._cp_stream.ptr)
+        self._stream = cuda.stream()
+        self.record = bool(self.params.record)
 
-    def compute(
-        self, img_path: str, depth_path: str, record: bool = False
-    ) -> KeypointsHost:
+        h, w = self.params.img_dims
+        dummy = np.random.rand(h, w).astype(np.float32)
+        self.data.input_img.copy_to_device(dummy, self._stream)
+        self._exec_graph()
+        if not self.record:
+            ptr = int(self._stream.handle.value)
+            self._ext_stream = cp.cuda.ExternalStream(ptr)
+            with self._ext_stream:
+                self._ext_stream.begin_capture()
+                self._exec_graph()
+                self._graph = self._ext_stream.end_capture()
+                self._graph.upload(self._ext_stream)
+
+    def _exec_graph(self) -> list[dict[str, object]]:
+        snapshots: list[dict[str, object]] = []
+
+        self.data.extrema.counter.copy_to_device(
+            np.array([0, 0], dtype=np.int32), self._stream
+        )
+        self.data.keypoints.counter.copy_to_device(
+            np.array([0, 0, 0], dtype=np.int32), self._stream
+        )
+
+        for o in range(self.params.n_oct):
+            snapshot = compute_octave(self.data, self.params, o, self._stream)
+            snapshots.append(snapshot)
+
+        self.data.keypoints.int_buffer.copy_to_host(
+            self.data.keypoints_host.int_buffer, self._stream
+        )
+        self.data.keypoints.float_buffer.copy_to_host(
+            self.data.keypoints_host.float_buffer, self._stream
+        )
+        self.data.keypoints.descriptors.copy_to_host(
+            self.data.keypoints_host.descriptors, self._stream
+        )
+        self.data.keypoints.counter.copy_to_host(
+            self.data.keypoints_host.counter, self._stream
+        )
+
+        return snapshots
+
+    def compute(self, img_path: str) -> KeypointsHost:
         img = read_gray_bt709(img_path)
-        depth = np.load(depth_path)
         assert img.shape == self.params.img_dims, (
             f"got {img.shape}, expected {self.params.img_dims}"
         )
-        assert depth.shape == self.params.depth_dims, (
-            f"got depth {depth.shape}, expected {self.params.depth_dims}"
-        )
-        snapshot = compute(
-            self.data, self.params, self._stream, img, depth, record=record
-        )
+        self.data.input_img.copy_to_device(img.astype(np.float32), self._stream)
+        snapshot = None
+        if not self.record:
+            with self._ext_stream:
+                self._graph.launch(self._ext_stream)
+        else:
+            snapshot = self._exec_graph()
         return self.data.keypoints_host.copy(), snapshot
 
-    def compute_many(self, img_paths: Iterable[str], record: bool = False):
+    def compute_many(self, img_paths: Iterable[str]):
         for p in img_paths:
-            yield self.compute_from_path(p, record=record)
+            yield self.compute_from_path(p)
 
 
 if __name__ == "__main__":
-    params = SiftParams(img_dims=(1440, 1920), depth_dims=(192, 256))
+    params = SiftParams(img_dims=(1440, 1920))
     sift = Sift(params)
-
-    m = np.load("data/sidewalk/intrinsics.npy")[37]
-    K = [m[0, 0], m[1, 1], m[0, 2], m[1, 2]]
-
-    res1, snapshot1 = sift.compute("data/sidewalk/img1.png", "data/sidewalk/depth1.npy")
-
+    res1, snapshot = sift.compute("data/sidewalk/images/1.png")
     print(res1.counter)
