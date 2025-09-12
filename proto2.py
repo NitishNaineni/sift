@@ -1055,9 +1055,9 @@ def discard_near_the_border(
         int(image_width),
     )
     if record:
-        total = int(data.extrema.counter.copy_to_host()[0])
-        ib_h = data.extrema.int_buffer[:total].copy_to_host()
-        fb_h = data.extrema.float_buffer[:total].copy_to_host()
+        total = int(data.extrema.counter.copy_to_host(stream=stream)[0])
+        ib_h = data.extrema.int_buffer[:total].copy_to_host(stream=stream)
+        fb_h = data.extrema.float_buffer[:total].copy_to_host(stream=stream)
         mask = ib_h[:, 0] == octave_index
         return (ib_h[mask], fb_h[mask])
     return None
