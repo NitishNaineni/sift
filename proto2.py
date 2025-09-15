@@ -296,6 +296,16 @@ def oversample_bilinear_kernel(src, dst, delta_min):
     )
 
 
+@cuda.jit(cache=True)
+def reset_counters_kernel(ext_counter, key_counter):
+    if cuda.blockIdx.x == 0 and cuda.threadIdx.x == 0:
+        ext_counter[0] = 0
+        ext_counter[1] = 0
+        key_counter[0] = 0
+        key_counter[1] = 0
+        key_counter[2] = 0
+
+
 @cuda.jit(device=True, inline=True, cache=True, fastmath=True)
 def mirror(i: int, n: int) -> int:
     if i < 0:
@@ -1280,11 +1290,8 @@ class Sift:
     def _exec_graph(self) -> list[dict[str, object]]:
         snapshots: list[dict[str, object]] = []
 
-        self.data.extrema.counter.copy_to_device(
-            np.array([0, 0], dtype=np.int32), self._stream
-        )
-        self.data.keypoints.counter.copy_to_device(
-            np.array([0, 0, 0], dtype=np.int32), self._stream
+        reset_counters_kernel[1, 1, self._stream](
+            self.data.extrema.counter, self.data.keypoints.counter
         )
 
         for o in range(self.params.n_oct):
@@ -1318,7 +1325,26 @@ class Sift:
                 self._graph.launch(self._ext_stream)
         else:
             snapshot = self._exec_graph()
+        self._warn_overflows()
         return self.data.keypoints_host.copy(), snapshot
+
+    def _warn_overflows(self) -> None:
+        # Ensure all device-to-host copies in the pipeline have completed
+        self._stream.synchronize()
+        # Keypoints overflow (counter[2])
+        kctr = self.data.keypoints_host.counter
+        if int(kctr[2]) > 0:
+            warnings.warn(
+                f"Keypoint overflow: {int(kctr[2])} entries dropped (capacity {self.params.max_keypoints})."
+            )
+        # Extrema overflow (counter[1])
+        ext = np.empty(2, dtype=np.int32)
+        self.data.extrema.counter.copy_to_host(ext, self._stream)
+        self._stream.synchronize()
+        if int(ext[1]) > 0:
+            warnings.warn(
+                f"Extrema overflow: {int(ext[1])} entries dropped (capacity {self.params.max_extrema})."
+            )
 
     def compute_many(self, img_paths: Iterable[str]):
         for p in img_paths:
@@ -1328,5 +1354,7 @@ class Sift:
 if __name__ == "__main__":
     params = SiftParams(img_dims=(1440, 1920))
     sift = Sift(params)
+    res1, snapshot = sift.compute("data/sidewalk/images/1.png")
+    print(res1.counter)
     res1, snapshot = sift.compute("data/sidewalk/images/1.png")
     print(res1.counter)
