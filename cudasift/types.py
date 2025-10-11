@@ -1,6 +1,4 @@
-"""
-Data structures and types for CUDA SIFT implementation.
-"""
+"""SIFT data structures and types."""
 
 from __future__ import annotations
 

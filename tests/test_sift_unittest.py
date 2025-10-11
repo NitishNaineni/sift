@@ -63,13 +63,13 @@ class SiftComputeMixin:
     @classmethod
     def _run_python_sift(cls):
         sys.path.append(str(cls.root))
-        from cudasift import Sift, SiftParams, read_gray_bt709
+        from cudasift import SiftDetector, read_gray_bt709
 
         img = read_gray_bt709(str(cls.img_path))
-        cls.params = SiftParams(img_dims=img.shape, record=True)
-        cls.sift = Sift(cls.params)
-        cls.sift.data.input_img.copy_to_device(img.astype(np.float32), cls.sift._stream)
-        cls.snapshots = cls.sift._exec_graph()
+        cls.detector = SiftDetector(img_dims=img.shape, record=True)
+        cls.params = cls.detector.params
+        cls.detector.data.input_img.copy_to_device(img.astype(np.float32), cls.detector._stream)
+        cls.snapshots = cls.detector._exec_graph()
 
     @classmethod
     def _build_and_run_c_reference(cls):

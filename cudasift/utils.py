@@ -1,6 +1,4 @@
-"""
-Utility functions for CUDA SIFT implementation.
-"""
+"""SIFT utility functions."""
 
 from __future__ import annotations
 

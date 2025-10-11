@@ -1,12 +1,4 @@
-"""
-CUDA Kernels for SIFT implementation.
-
-This module contains all CUDA/Numba JIT-compiled kernel functions.
-Type checking is minimal for this file because:
-1. Numba's @cuda.jit decorator transforms Python code to CUDA at runtime
-2. Type checkers cannot understand cuda.grid(), cuda.shared.array, etc.
-3. CUDA kernel invocation syntax kernel[grid, block](args) is not standard Python
-"""
+"""CUDA kernels for SIFT."""
 # pyright: basic
 
 from __future__ import annotations

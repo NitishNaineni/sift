@@ -1,6 +1,4 @@
-"""
-Core SIFT detector implementation with high-level API.
-"""
+"""CUDA SIFT detector implementation."""
 
 from __future__ import annotations
 
@@ -29,7 +27,7 @@ from .kernels import (
     reset_counters_kernel,
     upscale,
 )
-from .types import KeypointsHost, SiftData, SiftParams
+from .types import SiftData, SiftParams
 from .utils import (
     create_sift_data,
     format_keypoints,
@@ -366,75 +364,3 @@ class SiftDetector:
                 f"Consider increasing max_extrema parameter.",
                 stacklevel=3,
             )
-
-
-# Legacy compatibility class
-class Sift(SiftDetector):
-    """
-    Legacy SIFT class for backward compatibility.
-
-    Deprecated: Use SiftDetector instead.
-    """
-
-    def __init__(self, params: SiftParams):
-        """
-        Initialize legacy Sift with SiftParams object.
-
-        Args:
-            params: SiftParams object with configuration
-        """
-        if not cuda.is_available():
-            raise RuntimeError(
-                "CUDA is not available. Please ensure you have a CUDA-capable GPU "
-                "and the necessary drivers installed."
-            )
-
-        # Use the provided params directly instead of creating new ones
-        self.params = params
-        self.data = create_sift_data(self.params)
-        self._stream = cuda.stream()
-        self.record = bool(self.params.record)
-
-        # Warm up and optionally create CUDA graph
-        self._warmup()
-
-    def compute(self, img_path: str) -> tuple[KeypointsHost, list[dict[str, Any]] | None]:
-        """
-        Legacy compute method.
-
-        Deprecated: Use detect() or detect_with_snapshots() instead.
-        """
-        warnings.warn(
-            "Sift.compute() is deprecated. Use SiftDetector.detect() instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-
-        img = read_gray_bt709(img_path)
-        validate_image_dims(img, self.params.img_dims)
-
-        self.data.input_img.copy_to_device(img.astype(np.float32), self._stream)
-        snapshot = None
-
-        if not self.record:
-            with self._ext_stream:
-                self._graph.launch(self._ext_stream)
-        else:
-            snapshot = self._exec_graph()
-
-        self._warn_overflows()
-        return self.data.keypoints_host.copy(), snapshot
-
-    def compute_many(self, img_paths: Iterable[str]):
-        """
-        Legacy batch compute method.
-
-        Deprecated: Use detect_batch() instead.
-        """
-        warnings.warn(
-            "Sift.compute_many() is deprecated. Use SiftDetector.detect_batch() instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        for p in img_paths:
-            yield self.compute(p)
