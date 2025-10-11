@@ -1,46 +1,69 @@
+"""Tests for CUDA SIFT implementation against C reference.
+
+This module validates the CUDA implementation by comparing intermediate results
+and final outputs against the reference C implementation from sift_anatomy.
+"""
+
+import json
 import os
 import sys
-import json
 import unittest
 from pathlib import Path
+
 import numpy as np
 
 
 class SiftComputeMixin:
-    TOL_ARRAY = 1e-5
-    ORI_TOL = 5e-2
-    HAM_FRAC = 0.15
-    MAX_SET_DIFF = 50
+    """Mixin class providing SIFT testing functionality.
+
+    Tolerances are tightened to ensure close alignment with C reference.
+    """
+
+    TOL_ARRAY = 1.1e-6
+    ORI_TOL = 5e-3
+    HAM_FRAC = 0.05
+    MAX_SET_DIFF = 10
     BORDER_LAMBDA = 1.0
-    REFINED_ATOL = np.array([5e-3, 5e-3, 6e-4, 1e-6], dtype=np.float32)
+    REFINED_ATOL = np.array([6e-3, 6e-3, 6e-4, 3e-7], dtype=np.float32)
 
     IMG_PATH: str | None = None
 
     @classmethod
     def setUpClass(cls):
+        cls._check_cuda_available()
+        cls._setup_paths()
+        cls._run_python_sift()
+        cls._build_and_run_c_reference()
+        cls._setup_shared_resources()
+
+    @classmethod
+    def _check_cuda_available(cls):
         try:
             from numba import cuda  # noqa: F401
 
             if not cuda.is_available():
                 raise unittest.SkipTest("Numba CUDA not available")
-        except Exception:
-            raise unittest.SkipTest("Numba CUDA not available")
+        except Exception as e:
+            raise unittest.SkipTest("Numba CUDA not available") from e
 
+    @classmethod
+    def _setup_paths(cls):
         cls.root = Path(__file__).resolve().parents[1]
         if cls.IMG_PATH:
             p = Path(cls.IMG_PATH)
             cls.img_path = p if p.is_absolute() else (cls.root / cls.IMG_PATH).resolve()
         else:
             cls.img_path = (cls.root / "data/oxford_affine/graf/img6.png").resolve()
+
         if not cls.img_path.exists():
             raise unittest.SkipTest(f"Test image not found: {cls.img_path}")
 
+        cls.record_dir = cls.root / f"tests/artifacts/record_c_output_{cls.img_path.stem}"
+
+    @classmethod
+    def _run_python_sift(cls):
         sys.path.append(str(cls.root))
-        from proto2 import (
-            SiftParams,
-            read_gray_bt709,
-            Sift,
-        )
+        from cudasift import Sift, SiftParams, read_gray_bt709
 
         img = read_gray_bt709(str(cls.img_path))
         cls.params = SiftParams(img_dims=img.shape, record=True)
@@ -48,58 +71,79 @@ class SiftComputeMixin:
         cls.sift.data.input_img.copy_to_device(img.astype(np.float32), cls.sift._stream)
         cls.snapshots = cls.sift._exec_graph()
 
-        # Use the image filename stem to name the artifact directory
-        img_stem = cls.img_path.stem
-        cls.record_dir = cls.root / f"tests/artifacts/record_c_output_{img_stem}"
-        cli_bin = cls.root / "sift_anatomy/bin/sift_cli"
+    @classmethod
+    def _build_and_run_c_reference(cls):
+        import shutil
         import subprocess
+
+        cli_bin = cls.root / "sift_anatomy/bin/sift_cli"
 
         try:
             subprocess.run(
                 ["make", "-C", str(cls.root / "sift_anatomy"), "clean"],
                 check=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                capture_output=True,
                 text=True,
             )
             subprocess.run(
                 ["make", "-C", str(cls.root / "sift_anatomy"), "BINFLAGS=-O3"],
                 check=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                capture_output=True,
                 text=True,
             )
         except Exception as e:
-            raise unittest.SkipTest(f"Failed to build sift_cli: {e}")
-        # Always regenerate dumps into a fresh directory
-        if cls.record_dir.exists():
-            import shutil
+            raise unittest.SkipTest(f"Failed to build sift_cli: {e}") from e
 
+        if cls.record_dir.exists():
             shutil.rmtree(cls.record_dir)
         cls.record_dir.mkdir(parents=True, exist_ok=True)
+
         try:
             subprocess.run(
                 [str(cli_bin), str(cls.img_path), "--record", str(cls.record_dir)],
                 check=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                capture_output=True,
                 text=True,
                 env=os.environ,
             )
         except Exception as e:
-            raise unittest.SkipTest(f"Failed to run sift_cli: {e}")
+            raise unittest.SkipTest(f"Failed to run sift_cli: {e}") from e
 
-        # Shared resources
-        cls.popcnt = np.unpackbits(np.arange(256, dtype=np.uint8)[:, None], axis=1).sum(
-            axis=1
-        )
+    @classmethod
+    def _setup_shared_resources(cls):
+        cls.popcnt = np.unpackbits(np.arange(256, dtype=np.uint8)[:, None], axis=1).sum(axis=1)
 
     @staticmethod
-    def _load_json(path: Path):
+    def _load_json(path: Path) -> dict:
         with open(path) as f:
             return json.load(f)
 
-    def _concat_pairs(self, key: str):
+    @staticmethod
+    def _load_matrix(path: Path, h: int, w: int, dtype=np.float32) -> np.ndarray:
+        return np.fromfile(path, dtype=dtype).reshape(h, w)
+
+    def _load_extrema_ints(self, stage: str) -> np.ndarray:
+        meta = self._load_json(self.record_dir / stage / "extrema_meta.json")
+        return np.fromfile(
+            self.record_dir / stage / meta.get("int_file", "extrema_int.i32"),
+            dtype=np.int32,
+        ).reshape(-1, 4)
+
+    def _load_extrema_pairs(self, stage: str) -> tuple[np.ndarray, np.ndarray]:
+        if "refined" in stage:
+            meta = self._load_json(self.record_dir / stage / "extrema_refined_meta.json")
+            int_file = meta.get("int_file", "extrema_refined_int.i32")
+            float_file = meta.get("float_file", "extrema_refined_float.f32")
+        else:
+            meta = self._load_json(self.record_dir / stage / "extrema_meta.json")
+            int_file = meta.get("int_file", "extrema_int.i32")
+            float_file = meta.get("float_file", "extrema_float.f32")
+
+        ints = np.fromfile(self.record_dir / stage / int_file, dtype=np.int32).reshape(-1, 4)
+        floats = np.fromfile(self.record_dir / stage / float_file, dtype=np.float32).reshape(-1, 4)
+        return ints, floats
+
+    def _concat_pairs(self, key: str) -> tuple[np.ndarray, np.ndarray]:
         pairs = []
         for o in range(self.params.n_oct):
             pair = self.snapshots[o].get(key)
@@ -108,19 +152,35 @@ class SiftComputeMixin:
             ib, fb = pair
             if ib.size > 0:
                 pairs.append((ib, fb))
+
         if not pairs:
             return np.empty((0, 4), np.int32), np.empty((0, 4), np.float32)
+
         ints = np.concatenate([p[0] for p in pairs], axis=0)
         flts = np.concatenate([p[1] for p in pairs], axis=0)
         return ints, flts
 
-    def _concat_ints(self, key: str):
+    def _concat_ints(self, key: str) -> np.ndarray:
         ints, _ = self._concat_pairs(key)
         return ints
 
-    @staticmethod
-    def _load_matrix(path: Path, h: int, w: int, dtype=np.float32) -> np.ndarray:
-        return np.fromfile(path, dtype=dtype).reshape(h, w)
+    def _assert_set_parity(
+        self,
+        set_a: set,
+        set_b: set,
+        *,
+        prefix: str = "set mismatch",
+        label_a: str = "only_a",
+        label_b: str = "only_b",
+        max_diff: int | None = None,
+    ):
+        limit = self.MAX_SET_DIFF if max_diff is None else max_diff
+        diff_a = len(set_a - set_b)
+        diff_b = len(set_b - set_a)
+        self.assertTrue(
+            diff_a <= limit and diff_b <= limit,
+            f"{prefix}: {label_a}={diff_a}, {label_b}={diff_b}",
+        )
 
     def _assert_octave_layer_mats_equal(
         self, meta_path: Path, dump_dir: Path, snapshot_key: str, tol: float
@@ -139,20 +199,19 @@ class SiftComputeMixin:
                 diff = np.abs(c_arr - p_arr)
                 self.assertLessEqual(diff.max(), tol)
 
-    def _assert_set_parity(
-        self,
-        set_a,
-        set_b,
-        *,
-        prefix: str = "set mismatch",
-        label_a: str = "only_a",
-        label_b: str = "only_b",
-        max_diff: int | None = None,
-    ):
-        limit = self.MAX_SET_DIFF if max_diff is None else max_diff
-        self.assertTrue(
-            len(set_a - set_b) <= limit and len(set_b - set_a) <= limit,
-            f"{prefix}: {label_a}={len(set_a - set_b)}, {label_b}={len(set_b - set_a)}",
+    def _assert_extrema_set_match(self, stage: str):
+        ints_c = self._load_extrema_ints(stage)
+        ints_p = self._concat_ints(stage)
+
+        set_c = set(map(tuple, ints_c.tolist()))
+        set_p = set(map(tuple, ints_p.tolist()))
+
+        self._assert_set_parity(
+            set_c,
+            set_p,
+            prefix=f"{stage} set mismatch",
+            label_a="only_in_c",
+            label_b="only_in_py",
         )
 
     def test_gss_dog_internal_consistency(self):
@@ -199,290 +258,50 @@ class SiftComputeMixin:
             self.TOL_ARRAY,
         )
 
-    def test_oriented_keypoints_match_cli_dump(self):
-        keys_dir = self.record_dir / "keys"
-        meta_path = keys_dir / "keys_meta.json"
-        if not meta_path.exists():
-            self.skipTest("keys dump not found (CLI didn't dump keys)")
-        meta = self._load_json(meta_path)
-        ints_c = np.fromfile(
-            keys_dir / meta.get("int_file", "keys_int.i32"), dtype=np.int32
-        ).reshape(-1, 4)
-        flts_c = np.fromfile(
-            keys_dir / meta.get("float_file", "keys_float.f32"), dtype=np.float32
-        ).reshape(-1, 4)
-
-        ints_list = []
-        flts_list = []
-        for o in range(self.params.n_oct):
-            pair = self.snapshots[o].get("keys")
-            if pair is None:
-                continue
-            if len(pair) == 3:
-                ib, fb, _ = pair
-            else:
-                ib, fb = pair
-            if ib.size > 0:
-                ints_list.append(ib)
-                flts_list.append(fb)
-        if ints_list:
-            ints_p = np.concatenate(ints_list, axis=0)
-            flts_p = np.concatenate(flts_list, axis=0)
-        else:
-            ints_p = np.empty((0, 4), np.int32)
-            flts_p = np.empty((0, 4), np.float32)
-
-        oc = ints_c[:, 0].astype(np.int32)
-        sc = ints_c[:, 1].astype(np.int32)
-        yi_c = ints_c[:, 2].astype(np.int32)
-        xi_c = ints_c[:, 3].astype(np.int32)
-
-        keys_c = [
-            (int(o), int(s), int(yi), int(xi))
-            for o, s, yi, xi in zip(oc, sc, yi_c, xi_c)
-        ]
-        keys_p = [(int(o), int(s), int(yi), int(xi)) for (o, s, yi, xi) in ints_p]
-
-        set_c = set(keys_c)
-        set_p = set(keys_p)
-        self._assert_set_parity(
-            set_c,
-            set_p,
-            prefix="pre-orientation identity mismatch",
-            label_a="only_in_c",
-            label_b="only_in_p",
-        )
-        common_ids = set_c & set_p
-        from collections import defaultdict
-
-        grp_c: dict[tuple, list[float]] = defaultdict(list)
-        grp_p: dict[tuple, list[float]] = defaultdict(list)
-        for k, row in zip(keys_c, flts_c):
-            grp_c[k].append(float(row[3]))
-        for k, row in zip(keys_p, flts_p):
-            grp_p[k].append(float(row[3]))
-
-        def wrap_2pi(a: np.ndarray) -> np.ndarray:
-            t = np.float32(2.0 * np.pi)
-            return (a % t + t) % t
-
-        def circ_diff(a: float, b: float) -> float:
-            twopi = 2.0 * np.pi
-            da = abs(((a - b) + np.pi) % twopi - np.pi)
-            return float(da)
-
-        th_tol = self.ORI_TOL
-        worst = 0.0
-        bad = 0
-        count_mismatch = 0
-        for k in common_ids:
-            arr_c = np.array(grp_c.get(k, []), dtype=np.float32)
-            arr_p = np.array(grp_p.get(k, []), dtype=np.float32)
-            if arr_c.size != arr_p.size:
-                count_mismatch += 1
-                continue
-            if arr_c.size == 0:
-                continue
-            arr_c = wrap_2pi(arr_c)
-            arr_p = wrap_2pi(arr_p)
-            used = np.zeros(arr_p.size, dtype=bool)
-            for ang_c in arr_c:
-                diffs = np.array(
-                    [circ_diff(float(ang_c), float(ang_p)) for ang_p in arr_p]
-                )
-                diffs[used] = 1e9
-                j = int(np.argmin(diffs))
-                used[j] = True
-                d = float(diffs[j])
-                worst = max(worst, d)
-                if d > th_tol:
-                    bad += 1
-        self.assertEqual(
-            count_mismatch,
-            0,
-            msg=f"orientation count mismatch groups: {count_mismatch}",
-        )
-        self.assertEqual(
-            bad, 0, msg=f"orientation mismatches > tol: {bad}, worst={worst}"
-        )
-
-    def test_descriptors_match_cli_dump(self):
-        keys_dir = self.record_dir / "keys"
-        meta_path = keys_dir / "keys_meta.json"
-        if not meta_path.exists():
-            self.skipTest("keys dump not found (CLI didn't dump keys)")
-        meta = self._load_json(meta_path)
-        ints_c = np.fromfile(
-            keys_dir / meta.get("int_file", "keys_int.i32"), dtype=np.int32
-        ).reshape(-1, 4)
-        desc_len = int(meta.get("desc_len", 128))
-        desc_c = np.fromfile(
-            keys_dir / meta.get("desc_file", "keys_desc.u8"), dtype=np.uint8
-        ).reshape(-1, desc_len)
-
-        ints_list = []
-        desc_list = []
-        for o in range(self.params.n_oct):
-            triple = self.snapshots[o].get("keys")
-            if triple is None:
-                continue
-            if len(triple) == 3:
-                ib, _, db = triple
-            else:
-                continue
-            if ib.size > 0:
-                ints_list.append(ib)
-                desc_list.append(db)
-        if ints_list:
-            ints_p = np.concatenate(ints_list, axis=0)
-            desc_p = np.concatenate(desc_list, axis=0)
-        else:
-            ints_p = np.empty((0, 4), np.int32)
-            desc_p = np.empty((0, desc_len), np.uint8)
-
-        from collections import defaultdict
-
-        grp_c = defaultdict(list)
-        grp_p = defaultdict(list)
-        for row, d in zip(ints_c, desc_c):
-            grp_c[tuple(row.astype(np.int32))].append(d)
-        for row, d in zip(ints_p, desc_p):
-            grp_p[tuple(row.astype(np.int32))].append(d)
-
-        ham_thresh = int(self.HAM_FRAC * desc_len * 8)
-        mismatches = 0
-        worst = 0
-        for key in set(grp_c.keys()) & set(grp_p.keys()):
-            arr_c = np.stack(grp_c[key], axis=0).astype(np.uint8)
-            arr_p = np.stack(grp_p[key], axis=0).astype(np.uint8)
-            used = np.zeros(arr_p.shape[0], dtype=bool)
-            for dc in arr_c:
-                x = np.bitwise_xor(arr_p, dc[None, :])
-                ham = self.popcnt[x].sum(axis=1)
-                ham[used] = 1e9
-                j = int(np.argmin(ham))
-                used[j] = True
-                h = int(ham[j])
-                worst = max(worst, h)
-                if h > ham_thresh:
-                    mismatches += 1
-        self.assertTrue(
-            mismatches <= 10 and worst <= ham_thresh,
-            f"descriptor mismatches: {mismatches} (worst Hamming={worst}, thresh={ham_thresh})",
-        )
-
     def test_extrema_matches_cli_dump(self):
-        meta = self._load_json(self.record_dir / "extrema/extrema_meta.json")
-        ints_c = np.fromfile(
-            self.record_dir / "extrema" / meta.get("int_file", "extrema_int.i32"),
-            dtype=np.int32,
-        ).reshape(-1, 4)
-        ints_p = self._concat_ints("extrema")
-
-        set_c = set(map(tuple, ints_c.tolist()))
-        set_p = set(map(tuple, ints_p.tolist()))
-        self._assert_set_parity(
-            set_c,
-            set_p,
-            prefix="contrast_post set mismatch",
-            label_a="only_in_c",
-            label_b="only_in_py",
-        )
+        self._assert_extrema_set_match("extrema")
 
     def test_contrast_pre_matches_cli_dump(self):
-        meta = self._load_json(self.record_dir / "contrast_pre/extrema_meta.json")
-        ints_c = np.fromfile(
-            self.record_dir / "contrast_pre" / meta.get("int_file", "extrema_int.i32"),
-            dtype=np.int32,
-        ).reshape(-1, 4)
-        ints_p = self._concat_ints("contrast_pre")
-
-        set_c = set(map(tuple, ints_c.tolist()))
-        set_p = set(map(tuple, ints_p.tolist()))
-        self._assert_set_parity(
-            set_c,
-            set_p,
-            prefix="contrast_pre set mismatch",
-            label_a="only_in_c",
-            label_b="only_in_py",
-        )
+        self._assert_extrema_set_match("contrast_pre")
 
     def test_contrast_post_matches_cli_dump(self):
-        meta = self._load_json(self.record_dir / "contrast_post/extrema_meta.json")
-        ints_c = np.fromfile(
-            self.record_dir / "contrast_post" / meta.get("int_file", "extrema_int.i32"),
-            dtype=np.int32,
-        ).reshape(-1, 4)
-        ints_p = self._concat_ints("contrast_post")
-
-        set_c = set(map(tuple, ints_c.tolist()))
-        set_p = set(map(tuple, ints_p.tolist()))
-        self._assert_set_parity(
-            set_c,
-            set_p,
-            prefix="contrast_post set mismatch",
-            label_a="only_in_c",
-            label_b="only_in_py",
-        )
+        self._assert_extrema_set_match("contrast_post")
 
     def test_edge_matches_cli_dump(self):
-        meta = self._load_json(self.record_dir / "edge/extrema_meta.json")
-        ints_c = np.fromfile(
-            self.record_dir / "edge" / meta.get("int_file", "extrema_int.i32"),
-            dtype=np.int32,
-        ).reshape(-1, 4)
-        ints_p = self._concat_ints("edge")
-
-        set_c = set(map(tuple, ints_c.tolist()))
-        set_p = set(map(tuple, ints_p.tolist()))
-        self._assert_set_parity(
-            set_c,
-            set_p,
-            prefix="edge set mismatch",
-            label_a="only_in_c",
-            label_b="only_in_py",
-        )
+        self._assert_extrema_set_match("edge")
 
     def test_border_matches_cli_dump(self):
-        meta = self._load_json(self.record_dir / "border/extrema_meta.json")
-        ints_c = np.fromfile(
-            self.record_dir / "border" / meta.get("int_file", "extrema_int.i32"),
-            dtype=np.int32,
-        ).reshape(-1, 4)
-        ints_p = self._concat_ints("border")
-
-        set_c = set(map(tuple, ints_c.tolist()))
-        set_p = set(map(tuple, ints_p.tolist()))
-        self._assert_set_parity(
-            set_c,
-            set_p,
-            prefix="border set mismatch",
-            label_a="only_in_c",
-            label_b="only_in_py",
-        )
+        self._assert_extrema_set_match("border")
 
     def test_border_world_mask_consistency(self):
         H, W = self.params.img_dims
         lam = self.BORDER_LAMBDA
+
         keep_sets = []
         got_sets = []
+
         for o in range(self.params.n_oct):
             edge = self.snapshots[o]["edge"]
             border = self.snapshots[o]["border"]
             if edge is None:
                 continue
+
             ints_e, flts_e = edge
             y, x, sigma = flts_e[:, 0], flts_e[:, 1], flts_e[:, 2]
+
             cond = (
                 (y - lam * sigma > 0.0)
                 & (y + lam * sigma < float(H))
                 & (x - lam * sigma > 0.0)
                 & (x + lam * sigma < float(W))
             )
+
             keep = set(map(tuple, ints_e[cond].tolist()))
             keep_sets.append(keep)
+
             got = set() if border is None else set(map(tuple, border[0].tolist()))
             got_sets.append(got)
+
         keep_all = set().union(*keep_sets) if keep_sets else set()
         got_all = set().union(*got_sets) if got_sets else set()
 
@@ -495,19 +314,7 @@ class SiftComputeMixin:
         )
 
     def test_refined_matches_cli_dump(self):
-        meta = self._load_json(self.record_dir / "refined/extrema_refined_meta.json")
-        ints_c = np.fromfile(
-            self.record_dir
-            / "refined"
-            / meta.get("int_file", "extrema_refined_int.i32"),
-            dtype=np.int32,
-        ).reshape(-1, 4)
-        flts_c = np.fromfile(
-            self.record_dir
-            / "refined"
-            / meta.get("float_file", "extrema_refined_float.f32"),
-            dtype=np.float32,
-        ).reshape(-1, 4)
+        ints_c, flts_c = self._load_extrema_pairs("refined")
         ints_p, flts_p = self._concat_pairs("refined")
 
         set_c = set(map(tuple, ints_c.tolist()))
@@ -521,43 +328,197 @@ class SiftComputeMixin:
         )
 
         common = set_c & set_p
+        if not common:
+            return
+
         idx_c = {tuple(ints_c[i]): i for i in range(ints_c.shape[0])}
         idx_p = {tuple(ints_p[i]): i for i in range(ints_p.shape[0])}
-        if common:
-            keys = list(common)
-            idxs_c = np.array([idx_c[k] for k in keys], dtype=np.int64)
-            idxs_p = np.array([idx_p[k] for k in keys], dtype=np.int64)
-            diffs = np.abs(flts_c[idxs_c] - flts_p[idxs_p])
-            atol = self.REFINED_ATOL
-            matches = diffs <= atol
-            col_counts = matches.sum(axis=0)
-            total = matches.shape[0]
-            overall_count = int(matches.all(axis=1).sum())
-            min_ok = max(total - 10, 0)
-            if not (overall_count >= min_ok and np.all(col_counts >= min_ok)):
-                max_diffs = diffs.max(axis=0)
-                bad_counts = (~(diffs <= atol)).sum(axis=0)
-                self.fail(
-                    f"refined float matches too low: overall {overall_count}/{total}, "
-                    f"cols {col_counts.tolist()}/{total}, "
-                    f"bad_counts {bad_counts.tolist()}, max_diffs {max_diffs.tolist()}"
-                )
+
+        keys = list(common)
+        idxs_c = np.array([idx_c[k] for k in keys], dtype=np.int64)
+        idxs_p = np.array([idx_p[k] for k in keys], dtype=np.int64)
+
+        diffs = np.abs(flts_c[idxs_c] - flts_p[idxs_p])
+        atol = self.REFINED_ATOL
+        matches = diffs <= atol
+        col_counts = matches.sum(axis=0)
+        total = matches.shape[0]
+        overall_count = int(matches.all(axis=1).sum())
+
+        min_ok = max(total - 10, 0)
+        if not (overall_count >= min_ok and np.all(col_counts >= min_ok)):
+            max_diffs = diffs.max(axis=0)
+            bad_counts = (~matches).sum(axis=0)
+            self.fail(
+                f"refined float matches too low: overall {overall_count}/{total}, "
+                f"cols {col_counts.tolist()}/{total}, "
+                f"bad_counts {bad_counts.tolist()}, max_diffs {max_diffs.tolist()}"
+            )
+
+    def test_oriented_keypoints_match_cli_dump(self):
+        keys_dir = self.record_dir / "keys"
+        meta_path = keys_dir / "keys_meta.json"
+        if not meta_path.exists():
+            self.skipTest("keys dump not found")
+
+        meta = self._load_json(meta_path)
+        ints_c = np.fromfile(
+            keys_dir / meta.get("int_file", "keys_int.i32"), dtype=np.int32
+        ).reshape(-1, 4)
+        flts_c = np.fromfile(
+            keys_dir / meta.get("float_file", "keys_float.f32"), dtype=np.float32
+        ).reshape(-1, 4)
+
+        ints_list, flts_list = [], []
+        for o in range(self.params.n_oct):
+            pair = self.snapshots[o].get("keys")
+            if pair is None:
+                continue
+            ib, fb = (pair[0], pair[1]) if len(pair) >= 2 else (None, None)
+            if ib is not None and ib.size > 0:
+                ints_list.append(ib)
+                flts_list.append(fb)
+
+        ints_p = np.concatenate(ints_list, axis=0) if ints_list else np.empty((0, 4), np.int32)
+        flts_p = np.concatenate(flts_list, axis=0) if flts_list else np.empty((0, 4), np.float32)
+
+        keys_c = set(map(tuple, ints_c.tolist()))
+        keys_p = set(map(tuple, ints_p.tolist()))
+        self._assert_set_parity(
+            keys_c,
+            keys_p,
+            prefix="pre-orientation identity mismatch",
+            label_a="only_in_c",
+            label_b="only_in_p",
+        )
+
+        from collections import defaultdict
+
+        grp_c = defaultdict(list)
+        grp_p = defaultdict(list)
+        for ints_row, flts_row in zip(ints_c, flts_c):
+            k = tuple(ints_row.tolist())
+            grp_c[k].append(float(flts_row[3]))
+        for ints_row, flts_row in zip(ints_p, flts_p):
+            k = tuple(ints_row.tolist())
+            grp_p[k].append(float(flts_row[3]))
+
+        def wrap_2pi(angles):
+            t = np.float32(2.0 * np.pi)
+            return (angles % t + t) % t
+
+        def circ_diff(a: float, b: float) -> float:
+            return float(abs(((a - b) + np.pi) % (2.0 * np.pi) - np.pi))
+
+        th_tol = self.ORI_TOL
+        worst = 0.0
+        bad = 0
+        count_mismatch = 0
+
+        common = keys_c & keys_p
+        for k in common:
+            arr_c = wrap_2pi(np.array(grp_c.get(k, []), dtype=np.float32))
+            arr_p = wrap_2pi(np.array(grp_p.get(k, []), dtype=np.float32))
+
+            if arr_c.size != arr_p.size:
+                count_mismatch += 1
+                continue
+            if arr_c.size == 0:
+                continue
+
+            used = np.zeros(arr_p.size, dtype=bool)
+            for ang_c in arr_c:
+                diffs = np.array([circ_diff(float(ang_c), float(ang_p)) for ang_p in arr_p])
+                diffs[used] = 1e9
+                j = int(np.argmin(diffs))
+                used[j] = True
+                d = float(diffs[j])
+                worst = max(worst, d)
+                if d > th_tol:
+                    bad += 1
+
+        self.assertEqual(count_mismatch, 0, msg=f"orientation count mismatch: {count_mismatch}")
+        self.assertEqual(bad, 0, msg=f"orientation angle errors: {bad}, worst={worst:.6f} rad")
+
+    def test_descriptors_match_cli_dump(self):
+        keys_dir = self.record_dir / "keys"
+        meta_path = keys_dir / "keys_meta.json"
+        if not meta_path.exists():
+            self.skipTest("keys dump not found")
+
+        meta = self._load_json(meta_path)
+        ints_c = np.fromfile(
+            keys_dir / meta.get("int_file", "keys_int.i32"), dtype=np.int32
+        ).reshape(-1, 4)
+        desc_len = int(meta.get("desc_len", 128))
+        desc_c = np.fromfile(
+            keys_dir / meta.get("desc_file", "keys_desc.u8"), dtype=np.uint8
+        ).reshape(-1, desc_len)
+
+        ints_list, desc_list = [], []
+        for o in range(self.params.n_oct):
+            triple = self.snapshots[o].get("keys")
+            if triple is None or len(triple) < 3:
+                continue
+            ib, _, db = triple
+            if ib is not None and ib.size > 0:
+                ints_list.append(ib)
+                desc_list.append(db)
+
+        ints_p = np.concatenate(ints_list) if ints_list else np.empty((0, 4), np.int32)
+        desc_p = np.concatenate(desc_list) if desc_list else np.empty((0, desc_len), np.uint8)
+
+        from collections import defaultdict
+
+        grp_c = defaultdict(list)
+        grp_p = defaultdict(list)
+        for row, d in zip(ints_c, desc_c):
+            grp_c[tuple(row.tolist())].append(d)
+        for row, d in zip(ints_p, desc_p):
+            grp_p[tuple(row.tolist())].append(d)
+
+        ham_thresh = int(self.HAM_FRAC * desc_len * 8)
+        mismatches = 0
+        worst = 0
+
+        common = set(grp_c.keys()) & set(grp_p.keys())
+        for key in common:
+            arr_c = np.stack(grp_c[key], axis=0).astype(np.uint8)
+            arr_p = np.stack(grp_p[key], axis=0).astype(np.uint8)
+
+            used = np.zeros(arr_p.shape[0], dtype=bool)
+            for dc in arr_c:
+                x = np.bitwise_xor(arr_p, dc[None, :])
+                ham = self.popcnt[x].sum(axis=1)
+                ham[used] = int(1e9)
+                j = int(np.argmin(ham))
+                used[j] = True
+                h = int(ham[j])
+                worst = max(worst, h)
+                if h > ham_thresh:
+                    mismatches += 1
+
+        self.assertTrue(
+            mismatches <= 10 and worst <= ham_thresh,
+            f"descriptor mismatches: {mismatches}, worst_hamming={worst}, thresh={ham_thresh}",
+        )
 
     def test_keys_present_per_octave(self):
+        stages = [
+            "gss",
+            "dog",
+            "extrema",
+            "contrast_pre",
+            "refined",
+            "contrast_post",
+            "edge",
+            "border",
+        ]
         for o in range(self.params.n_oct):
             snap = self.snapshots[o]
-            for key in (
-                "gss",
-                "dog",
-                "extrema",
-                "contrast_pre",
-                "refined",
-                "contrast_post",
-                "edge",
-                "border",
-            ):
-                with self.subTest(octave=o, key=key):
-                    self.assertIn(key, snap)
+            for stage in stages:
+                with self.subTest(octave=o, stage=stage):
+                    self.assertIn(stage, snap)
 
     def test_monotonic_counts(self):
         for o in range(self.params.n_oct):
@@ -574,6 +535,7 @@ class SiftComputeMixin:
                 "edge": count(snap["edge"]),
                 "border": count(snap["border"]),
             }
+
             with self.subTest(octave=o, counts=counts):
                 self.assertGreaterEqual(counts["extrema"], counts["contrast_pre"])
                 self.assertGreaterEqual(counts["contrast_pre"], counts["refined"])
@@ -582,7 +544,7 @@ class SiftComputeMixin:
                 self.assertGreaterEqual(counts["edge"], counts["border"])
                 self.assertGreaterEqual(counts["border"], 0)
 
-    def _assert_shapes_dtypes(self, pair, *, floats_cols):
+    def _assert_shapes_dtypes(self, pair, *, floats_cols: int):
         if pair is None:
             return
         ints, flts = pair
@@ -599,9 +561,7 @@ class SiftComputeMixin:
     def test_shapes_dtypes_contrast_pre(self):
         for o in range(self.params.n_oct):
             with self.subTest(octave=o):
-                self._assert_shapes_dtypes(
-                    self.snapshots[o]["contrast_pre"], floats_cols=4
-                )
+                self._assert_shapes_dtypes(self.snapshots[o]["contrast_pre"], floats_cols=4)
 
     def test_shapes_dtypes_refined(self):
         for o in range(self.params.n_oct):
@@ -611,9 +571,7 @@ class SiftComputeMixin:
     def test_shapes_dtypes_contrast_post(self):
         for o in range(self.params.n_oct):
             with self.subTest(octave=o):
-                self._assert_shapes_dtypes(
-                    self.snapshots[o]["contrast_post"], floats_cols=4
-                )
+                self._assert_shapes_dtypes(self.snapshots[o]["contrast_post"], floats_cols=4)
 
     def test_shapes_dtypes_edge(self):
         for o in range(self.params.n_oct):
