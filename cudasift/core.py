@@ -57,7 +57,7 @@ def _compute_octave(
     snapshot: dict[str, Any] = {}
     record = bool(params.record)
 
-    # Reset extrema counter
+    # Reset extrema counter for this octave
     data.extrema.counter.copy_to_device(np.array([0, 0], dtype=np.int32), stream)
 
     # Set up the first scale of this octave
@@ -218,18 +218,18 @@ class SiftDetector:
         """Execute the SIFT computation graph."""
         snapshots: list[dict[str, Any]] = []
 
-        # Reset counters
+        # Reset counters once (not per octave)
         reset_counters_kernel[1, 1, self._stream](
             self.data.extrema.counter, self.data.keypoints.counter
         )
 
-        # Process each octave
+        # Process each octave sequentially (dependencies exist)
         for o in range(self.params.n_oct):
             snapshot = _compute_octave(self.data, self.params, o, self._stream)
             if snapshot is not None:
                 snapshots.append(snapshot)
 
-        # Copy results to host
+        # Single batch copy to host at the end (async)
         self.data.keypoints.int_buffer.copy_to_host(
             self.data.keypoints_host.int_buffer, self._stream
         )
