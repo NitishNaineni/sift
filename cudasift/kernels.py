@@ -24,7 +24,7 @@ NHIST2 = NHIST * NHIST
 DESC_LEN = NHIST2 * NORIBIN
 LAMBDA_DESC = numba.float32(6.0)
 ORI_THRESHOLD = numba.float32(0.8)
-BLUR_TH = 128
+BLUR_TH = 256
 MAX_GAUSS_RADIUS = 16
 GRAD_TILE_SIZE = (TX + 2) * (TY + 2)
 GAUSS_HORZ_TILE_SIZE = BLUR_TH + 2 * MAX_GAUSS_RADIUS
@@ -515,7 +515,7 @@ def detect_extrema(
 def refine_extrema(
     data: SiftData, params: SiftParams, octave_index: int, stream, record: bool = False
 ):
-    threads = 128
+    threads = 256
     blocks = (params.max_extrema + threads - 1) // threads
     refine_kernel[blocks, threads, stream](
         data.dog[octave_index],
@@ -546,7 +546,7 @@ def discard_with_low_response(
     record: bool = False,
 ):
     thresh = numba.float32(float(params.C_dog) * float(multiplier))
-    threads = 128
+    threads = 256
     blocks = (data.extrema.int_buffer.shape[0] + threads - 1) // threads
     discard_with_low_response_kernel[blocks, threads, stream](
         data.extrema.int_buffer,
@@ -759,7 +759,7 @@ def orientation_kernel(
 def discard_on_edge(
     data: SiftData, params: SiftParams, octave_index: int, stream, record: bool = False
 ):
-    threads = 128
+    threads = 256
     blocks = (data.extrema.int_buffer.shape[0] + threads - 1) // threads
     discard_on_edge_kernel[blocks, threads, stream](
         data.dog[octave_index],
@@ -781,7 +781,7 @@ def discard_near_the_border(
     data: SiftData, params: SiftParams, octave_index: int, stream, record: bool = False
 ):
     image_height, image_width = params.img_dims
-    threads = 128
+    threads = 256
     blocks = (data.extrema.int_buffer.shape[0] + threads - 1) // threads
     discard_near_the_border_kernel[blocks, threads, stream](
         data.extrema.int_buffer,

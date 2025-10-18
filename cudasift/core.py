@@ -34,6 +34,7 @@ from .utils import (
     read_gray_bt709,
     validate_image_dims,
 )
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 def _compute_octave(
@@ -42,18 +43,6 @@ def _compute_octave(
     octave_index: int,
     stream,
 ) -> dict[str, Any] | None:
-    """
-    Compute SIFT features for a single octave.
-
-    Args:
-        data: SIFT data structures
-        params: SIFT parameters
-        octave_index: Index of the octave to compute
-        stream: CUDA stream for computation
-
-    Returns:
-        Snapshot dictionary if recording is enabled, None otherwise
-    """
     snapshot: dict[str, Any] = {}
     record = bool(params.record)
 
@@ -103,7 +92,6 @@ def _compute_octave(
 
 
 def _set_seed(data: SiftData, params: SiftParams, stream):
-    """Initialize the seed image for the first octave."""
     assert params.sigma_min >= params.sigma_in
     upscale(data.input_img, data.seed_img, params.delta_min, stream)
     assert params.inc_sigmas is not None and params.gauss_kernels is not None
@@ -120,7 +108,6 @@ def _set_seed(data: SiftData, params: SiftParams, stream):
 
 
 def _set_first_scale(data: SiftData, params: SiftParams, octave_index: int, stream):
-    """Initialize the first scale of an octave by downsampling the previous octave."""
     src = data.gss[octave_index - 1][params.n_spo]
     dst = data.gss[octave_index][0]
     assert params.gss_shapes is not None
@@ -130,21 +117,7 @@ def _set_first_scale(data: SiftData, params: SiftParams, octave_index: int, stre
 
 
 class SiftDetector:
-    """
-    CUDA-accelerated SIFT feature detector.
-
-    This class provides a high-level API for detecting and extracting SIFT features
-    from images using GPU acceleration via CUDA.
-
-    Example:
-        >>> detector = SiftDetector(img_dims=(480, 640))
-        >>> keypoints, descriptors = detector.detect("image.png")
-        >>> print(f"Found {len(keypoints)} keypoints")
-
-    Attributes:
-        params: SIFT parameters controlling detection behavior
-        data: Internal GPU data structures
-    """
+    """CUDA-accelerated SIFT feature detector."""
 
     def __init__(
         self,
@@ -157,21 +130,6 @@ class SiftDetector:
         record: bool = False,
         **kwargs,
     ):
-        """
-        Initialize the SIFT detector.
-
-        Args:
-            img_dims: Image dimensions as (height, width)
-            n_oct: Number of octaves (-1 for automatic)
-            n_spo: Number of scales per octave
-            sigma_min: Minimum sigma for SIFT
-            max_keypoints: Maximum number of keypoints to extract
-            record: Whether to record intermediate computation results
-            **kwargs: Additional parameters passed to SiftParams
-
-        Raises:
-            RuntimeError: If CUDA is not available
-        """
         if not cuda.is_available():
             raise RuntimeError(
                 "CUDA is not available. Please ensure you have a CUDA-capable GPU "
@@ -198,14 +156,12 @@ class SiftDetector:
         self._warmup()
 
     def _warmup(self) -> None:
-        """Warm up the detector and create CUDA graph if not recording."""
         h, w = self.params.img_dims
         dummy = np.random.rand(h, w).astype(np.float32)
         self.data.input_img.copy_to_device(dummy, self._stream)
         self._exec_graph()
 
         if not self.record:
-            # Create CUDA graph for faster repeated execution
             ptr = int(self._stream.handle.value)
             self._ext_stream = cp.cuda.ExternalStream(ptr)
             with self._ext_stream:
@@ -215,21 +171,15 @@ class SiftDetector:
                 self._graph.upload(self._ext_stream)
 
     def _exec_graph(self) -> list[dict[str, Any]]:
-        """Execute the SIFT computation graph."""
         snapshots: list[dict[str, Any]] = []
-
-        # Reset counters once (not per octave)
         reset_counters_kernel[1, 1, self._stream](
             self.data.extrema.counter, self.data.keypoints.counter
         )
-
-        # Process each octave sequentially (dependencies exist)
         for o in range(self.params.n_oct):
             snapshot = _compute_octave(self.data, self.params, o, self._stream)
             if snapshot is not None:
                 snapshots.append(snapshot)
 
-        # Single batch copy to host at the end (async)
         self.data.keypoints.int_buffer.copy_to_host(
             self.data.keypoints_host.int_buffer, self._stream
         )
@@ -244,106 +194,79 @@ class SiftDetector:
         return snapshots
 
     def detect(self, image: str | Path | np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """
-        Detect and extract SIFT features from an image.
-
-        Args:
-            image: Input image as file path or numpy array
-
-        Returns:
-            Tuple of (keypoints, descriptors) where:
-            - keypoints: Nx4 array with columns [x, y, scale, orientation]
-            - descriptors: Nx128 array of uint8 descriptors
-
-        Raises:
-            ValueError: If image dimensions don't match
-            FileNotFoundError: If image file doesn't exist
-        """
-        # Load image
         if isinstance(image, (str, Path)):
             img = read_gray_bt709(image)
         else:
             img = image
-
-        # Validate dimensions
         validate_image_dims(img, self.params.img_dims)
-
-        # Copy to device and compute
-        self.data.input_img.copy_to_device(img.astype(np.float32), self._stream)
+        if img.dtype != np.float32:
+            img = np.asarray(img, dtype=np.float32)
+        self.data.input_img.copy_to_device(img, self._stream)
 
         if not self.record:
-            # Use CUDA graph for faster execution
             with self._ext_stream:
                 self._graph.launch(self._ext_stream)
         else:
             self._exec_graph()
 
-        # Check for overflows
         self._warn_overflows()
-
-        # Format and return results
         return format_keypoints(self.data.keypoints_host)
 
     def detect_with_snapshots(
         self, image: str | Path | np.ndarray
     ) -> tuple[np.ndarray, np.ndarray, list[dict[str, Any]]]:
-        """
-        Detect SIFT features and return intermediate computation results.
-
-        Note: This method is slower as it records intermediate results.
-
-        Args:
-            image: Input image as file path or numpy array
-
-        Returns:
-            Tuple of (keypoints, descriptors, snapshots)
-        """
         if not self.record:
             warnings.warn(
                 "Snapshots not enabled. Create detector with record=True to get snapshots.",
                 stacklevel=2,
             )
-
-        # Load image
         if isinstance(image, (str, Path)):
             img = read_gray_bt709(image)
         else:
             img = image
-
-        # Validate dimensions
         validate_image_dims(img, self.params.img_dims)
-
-        # Copy to device and compute
-        self.data.input_img.copy_to_device(img.astype(np.float32), self._stream)
+        if img.dtype != np.float32:
+            img = np.asarray(img, dtype=np.float32)
+        self.data.input_img.copy_to_device(img, self._stream)
         snapshots = self._exec_graph()
-
-        # Check for overflows
         self._warn_overflows()
-
-        # Format and return results
         keypoints, descriptors = format_keypoints(self.data.keypoints_host)
         return keypoints, descriptors, snapshots
 
     def detect_batch(
         self, images: Iterable[str | Path | np.ndarray]
     ) -> list[tuple[np.ndarray, np.ndarray]]:
-        """
-        Detect SIFT features from multiple images.
+        from concurrent.futures import ThreadPoolExecutor
 
-        Args:
-            images: Iterable of image paths or arrays
+        images_list = list(images)
+        has_paths = any(isinstance(img, (str, Path)) for img in images_list)
 
-        Returns:
-            List of (keypoints, descriptors) tuples
-        """
-        return [self.detect(img) for img in images]
+        if not has_paths or len(images_list) == 1:
+            return [self.detect(img) for img in images_list]
+
+        results = []
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            future = executor.submit(self._load_image, images_list[0])
+            for i in range(len(images_list)):
+                img = future.result()
+                if i + 1 < len(images_list):
+                    future = executor.submit(self._load_image, images_list[i + 1])
+                kp, desc = self.detect(img)
+                results.append((kp, desc))
+        return results
+
+    def _load_image(self, image: str | Path | np.ndarray) -> np.ndarray:
+        if isinstance(image, (str, Path)):
+            img = read_gray_bt709(image)
+        else:
+            img = image
+        if img.dtype != np.float32:
+            img = np.asarray(img, dtype=np.float32)
+        validate_image_dims(img, self.params.img_dims)
+        return img
 
     def _warn_overflows(self) -> None:
-        """Check for buffer overflows and issue warnings."""
-        # Ensure all device-to-host copies have completed
         self._stream.synchronize()
-
-        # Check keypoint overflow
         kctr = self.data.keypoints_host.counter
         if int(kctr[2]) > 0:
             warnings.warn(
@@ -352,8 +275,6 @@ class SiftDetector:
                 f"Consider increasing max_keypoints parameter.",
                 stacklevel=3,
             )
-
-        # Check extrema overflow
         ext = np.empty(2, dtype=np.int32)
         self.data.extrema.counter.copy_to_host(ext, self._stream)
         self._stream.synchronize()
@@ -364,3 +285,55 @@ class SiftDetector:
                 f"Consider increasing max_extrema parameter.",
                 stacklevel=3,
             )
+
+
+class BatchSiftDetector:
+    """Multi-stream SIFT detector for batch processing."""
+
+    def __init__(self, img_dims: tuple[int, int], num_streams: int = 4, **kwargs):
+        if not cuda.is_available():
+            raise RuntimeError("CUDA is not available")
+        if num_streams < 1 or num_streams > 16:
+            raise ValueError(f"num_streams must be between 1 and 16, got {num_streams}")
+
+        self.num_streams = num_streams
+        self.img_dims = img_dims
+        self.detectors = [
+            SiftDetector(img_dims=img_dims, record=False, **kwargs) for _ in range(num_streams)
+        ]
+
+    def detect_batch(
+        self, images: list[str | Path | np.ndarray], show_progress: bool = False
+    ) -> list[tuple[np.ndarray, np.ndarray]]:
+        if not images:
+            return []
+        if len(images) == 1:
+            return [self.detectors[0].detect(images[0])]
+
+        results = [None] * len(images)
+        with ThreadPoolExecutor(max_workers=self.num_streams) as executor:
+            future_to_idx = {
+                executor.submit(self.detectors[idx % self.num_streams].detect, image): idx
+                for idx, image in enumerate(images)
+            }
+
+            completed = 0
+            for future in as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                results[idx] = future.result()
+                completed += 1
+                if show_progress and completed % max(1, len(images) // 10) == 0:
+                    print(f"Progress: {completed}/{len(images)}")
+
+        if show_progress:
+            print(f"✓ Completed: {len(images)}")
+        return results
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        for detector in self.detectors:
+            del detector
+        cuda.synchronize()
+        return False
