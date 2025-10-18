@@ -790,6 +790,7 @@ def discard_near_the_border(
         int(octave_index),
         int(image_height),
         int(image_width),
+        numba.float32(1.0),
     )
     if record:
         total = int(data.extrema.counter.copy_to_host(stream=stream)[0])
@@ -801,7 +802,9 @@ def discard_near_the_border(
 
 
 @cuda.jit(cache=True, fastmath=True)  # type: ignore[misc]
-def discard_near_the_border_kernel(int_buf, float_buf, ext_count, oct_idx, image_h, image_w):
+def discard_near_the_border_kernel(
+    int_buf, float_buf, ext_count, oct_idx, image_h, image_w, lambda_border
+):
     idx = cuda.grid(1)
     if idx >= ext_count[0]:
         return
@@ -812,10 +815,10 @@ def discard_near_the_border_kernel(int_buf, float_buf, ext_count, oct_idx, image
     x = float_buf[idx, 1]
     sigma = float_buf[idx, 2]
     if not (
-        (y - sigma > numba.float32(0.0))
-        and (y + sigma < numba.float32(image_h))
-        and (x - sigma > numba.float32(0.0))
-        and (x + sigma < numba.float32(image_w))
+        (y - lambda_border * sigma > numba.float32(0.0))
+        and (y + lambda_border * sigma < numba.float32(image_h))
+        and (x - lambda_border * sigma > numba.float32(0.0))
+        and (x + lambda_border * sigma < numba.float32(image_w))
     ):
         int_buf[idx, 0] = -1
 
