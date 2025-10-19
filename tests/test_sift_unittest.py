@@ -130,7 +130,9 @@ class SiftComputeMixin:
         if not cls.img_path.exists():
             raise unittest.SkipTest(f"Test image not found: {cls.img_path}")
 
-        cls.record_dir = cls.root / f"tests/artifacts/record_c_output_{cls.img_path.stem}"
+        cls.record_dir = (
+            cls.root / f"tests/artifacts/record_c_output_{cls.img_path.stem}"
+        )
 
     @classmethod
     def _run_python_sift(cls):
@@ -140,8 +142,10 @@ class SiftComputeMixin:
         img = read_gray_bt709(str(cls.img_path))
         cls.detector = SiftDetector(img_dims=img.shape, record=True)
         cls.params = cls.detector.params
-        cls.detector.data.input_img.copy_to_device(img.astype(np.float32), cls.detector._stream)
-        cls.snapshots = cls.detector._exec_graph()
+        cls.detector.data.input_img.copy_to_device(
+            img.astype(np.float32), cls.detector._stream
+        )
+        cls.snapshots = cls.detector._compute()
 
     @classmethod
     def _build_and_run_c_reference(cls):
@@ -178,7 +182,9 @@ class SiftComputeMixin:
 
     @classmethod
     def _setup_shared_resources(cls):
-        cls.popcnt = np.unpackbits(np.arange(256, dtype=np.uint8)[:, None], axis=1).sum(axis=1)
+        cls.popcnt = np.unpackbits(np.arange(256, dtype=np.uint8)[:, None], axis=1).sum(
+            axis=1
+        )
 
     @staticmethod
     def _load_json(path: Path) -> dict:
@@ -198,7 +204,9 @@ class SiftComputeMixin:
 
     def _load_extrema_pairs(self, stage: str) -> tuple[np.ndarray, np.ndarray]:
         if "refined" in stage:
-            meta = self._load_json(self.record_dir / stage / "extrema_refined_meta.json")
+            meta = self._load_json(
+                self.record_dir / stage / "extrema_refined_meta.json"
+            )
             int_file = meta.get("int_file", "extrema_refined_int.i32")
             float_file = meta.get("float_file", "extrema_refined_float.f32")
         else:
@@ -206,8 +214,12 @@ class SiftComputeMixin:
             int_file = meta.get("int_file", "extrema_int.i32")
             float_file = meta.get("float_file", "extrema_float.f32")
 
-        ints = np.fromfile(self.record_dir / stage / int_file, dtype=np.int32).reshape(-1, 4)
-        floats = np.fromfile(self.record_dir / stage / float_file, dtype=np.float32).reshape(-1, 4)
+        ints = np.fromfile(self.record_dir / stage / int_file, dtype=np.int32).reshape(
+            -1, 4
+        )
+        floats = np.fromfile(
+            self.record_dir / stage / float_file, dtype=np.float32
+        ).reshape(-1, 4)
         return ints, floats
 
     def _concat_pairs(self, key: str) -> tuple[np.ndarray, np.ndarray]:
@@ -457,8 +469,16 @@ class SiftComputeMixin:
                 ints_list.append(ib)
                 flts_list.append(fb)
 
-        ints_p = np.concatenate(ints_list, axis=0) if ints_list else np.empty((0, 4), np.int32)
-        flts_p = np.concatenate(flts_list, axis=0) if flts_list else np.empty((0, 4), np.float32)
+        ints_p = (
+            np.concatenate(ints_list, axis=0)
+            if ints_list
+            else np.empty((0, 4), np.int32)
+        )
+        flts_p = (
+            np.concatenate(flts_list, axis=0)
+            if flts_list
+            else np.empty((0, 4), np.float32)
+        )
 
         keys_c = set(map(tuple, ints_c.tolist()))
         keys_p = set(map(tuple, ints_p.tolist()))
@@ -507,7 +527,9 @@ class SiftComputeMixin:
 
             used = np.zeros(arr_p.size, dtype=bool)
             for ang_c in arr_c:
-                diffs = np.array([circ_diff(float(ang_c), float(ang_p)) for ang_p in arr_p])
+                diffs = np.array(
+                    [circ_diff(float(ang_c), float(ang_p)) for ang_p in arr_p]
+                )
                 diffs[used] = 1e9
                 j = int(np.argmin(diffs))
                 used[j] = True
@@ -519,10 +541,14 @@ class SiftComputeMixin:
         max_count_mismatch = int(np.ceil(self.ORI_MISMATCH_PCT * len(common)))
         max_angle_errors = int(np.ceil(self.ORI_MISMATCH_PCT * len(common)))
         self.assertLessEqual(
-            count_mismatch, max_count_mismatch, msg=f"orientation count mismatch: {count_mismatch}"
+            count_mismatch,
+            max_count_mismatch,
+            msg=f"orientation count mismatch: {count_mismatch}",
         )
         self.assertLessEqual(
-            bad, max_angle_errors, msg=f"orientation angle errors: {bad}, worst={worst:.6f} rad"
+            bad,
+            max_angle_errors,
+            msg=f"orientation angle errors: {bad}, worst={worst:.6f} rad",
         )
 
     def test_descriptors_match_cli_dump(self):
@@ -551,7 +577,11 @@ class SiftComputeMixin:
                 desc_list.append(db)
 
         ints_p = np.concatenate(ints_list) if ints_list else np.empty((0, 4), np.int32)
-        desc_p = np.concatenate(desc_list) if desc_list else np.empty((0, desc_len), np.uint8)
+        desc_p = (
+            np.concatenate(desc_list)
+            if desc_list
+            else np.empty((0, desc_len), np.uint8)
+        )
 
         from collections import defaultdict
 
@@ -648,7 +678,9 @@ class SiftComputeMixin:
     def test_shapes_dtypes_contrast_pre(self):
         for o in range(self.params.n_oct):
             with self.subTest(octave=o):
-                self._assert_shapes_dtypes(self.snapshots[o]["contrast_pre"], floats_cols=4)
+                self._assert_shapes_dtypes(
+                    self.snapshots[o]["contrast_pre"], floats_cols=4
+                )
 
     def test_shapes_dtypes_refined(self):
         for o in range(self.params.n_oct):
@@ -658,7 +690,9 @@ class SiftComputeMixin:
     def test_shapes_dtypes_contrast_post(self):
         for o in range(self.params.n_oct):
             with self.subTest(octave=o):
-                self._assert_shapes_dtypes(self.snapshots[o]["contrast_post"], floats_cols=4)
+                self._assert_shapes_dtypes(
+                    self.snapshots[o]["contrast_post"], floats_cols=4
+                )
 
     def test_shapes_dtypes_edge(self):
         for o in range(self.params.n_oct):
@@ -695,7 +729,9 @@ def create_div2k_test_classes():
 
         class_name = f"TestSiftDIV2K_{img_name}"
         test_class = type(
-            class_name, (SiftComputeMixin, unittest.TestCase), {"IMG_PATH": str(img_path)}
+            class_name,
+            (SiftComputeMixin, unittest.TestCase),
+            {"IMG_PATH": str(img_path)},
         )
         globals()[class_name] = test_class
 
